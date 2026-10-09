@@ -1,0 +1,5 @@
+# The development repo, the default secrets directories, and the default
+# git store: none of them ships.
+dev/
+secrets/
+git/
