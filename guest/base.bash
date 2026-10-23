@@ -68,9 +68,10 @@ NFT
 systemctl enable --now nftables
 nft -f /etc/nftables.conf
 
-# What the guest needs to know about how it was built: the agent and the
-# mixins. verify.sh reads this; nothing in the repo hard-codes a name.
+# What the guest needs to know about how it was built: the agent, mixins,
+# and default harness. verify.sh reads this; no name is hard-coded.
 {
   printf 'LAB_AGENT=%q\n' "$agent"
   printf 'LAB_MIXINS=%q\n' "$PARAM_LabMixins"
+  printf 'LAB_HARNESS=%q\n' "$PARAM_LabHarness"
 } > /etc/lab.env

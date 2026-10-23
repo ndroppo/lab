@@ -29,15 +29,19 @@ die()  { warn "$*"; exit 1; }
 
 usage() {
   cat <<'USAGE'
-usage: lab [create | rebuild | harden] [options]
+usage: lab [options] [harness] [-- args...]
+       lab create|rebuild|harden [options]
 
-  lab            start the instance, creating it first if run from a terminal
+  lab            start the default harness, creating the instance first
+                 if run from a terminal; no default opens a shell
+  lab <harness>  start one of the instance's mixins as a command
   lab create     create an instance without starting it
   lab rebuild    delete and recreate an instance lab built, its current
                  answers offered back as defaults
   lab harden     move exposed git metadata out of the guest's reach
 
   --instance <name>        which instance (default: lab)
+  --shell                  open the agent's login shell, not a harness
   --yes                    take every default without asking; on create the
                            defaults are empty: a bare room, walls only,
                            nothing mounted, no harness
@@ -285,6 +289,14 @@ available_mixins() {
   done
 }
 
+# Recorded mixins are a space-separated list of command names.
+has_mixin() {
+  for m in $1; do   # split the mixin list on purpose
+    [[ $m == "$2" ]] && return 0
+  done
+  return 1
+}
+
 # ask_mixins <current>: fills MIX, one y/n per mixin in the repo, defaulting
 # to yes for those the instance already has.
 ask_mixins() {
@@ -296,18 +308,44 @@ ask_mixins() {
   done
 }
 
-# interview: fills RW, RO, MIX, offering D_RW, D_RO, D_MIX as defaults
-# where set.
+# ask_harness: choose a default from the selected mixins.
+ask_harness() {
+  DEFAULT_HARNESS=${MIX[0]}
+  (( ${#MIX[@]} > 1 )) || return 0
+  if has_mixin "${MIX[*]}" "$D_HARNESS"; then
+    DEFAULT_HARNESS=$D_HARNESS
+  fi
+  [[ $YES ]] && return
+  while :; do
+    answer=""
+    read -p "  Default harness (${MIX[*]}) [$DEFAULT_HARNESS]: " answer
+    answer=${answer:-$DEFAULT_HARNESS}
+    if has_mixin "${MIX[*]}" "$answer"; then
+      DEFAULT_HARNESS=$answer
+      return
+    fi
+    echo "    choose one of: ${MIX[*]}"
+  done
+}
+
+# interview: fills RW, RO, MIX, DEFAULT_HARNESS, offering the instance's
+# current answers back on rebuild.
 interview() {
   [[ $YES ]] || echo "Instance $INST"
   ask_dir_list "Read-write" "${D_RW[@]}"; RW=("${DIRS[@]}")
   ask_dir_list "Read-only" "${D_RO[@]}"; RO=("${DIRS[@]}")
   ask_mixins "$D_MIX"
+  ask_harness
 }
 
 # The plan's walls, before anything is mounted.
 check_plan() {
   bad=0
+  for m in "${MIX[@]}"; do
+    case $m in
+      create|rebuild|harden) warn "Mixin $m conflicts with a Lab verb."; bad=1 ;;
+    esac
+  done
   private_wall "${RW[@]}" "${RO[@]}" || bad=1
   repo_wall "${RW[@]}" || bad=1
   (( bad == 0 ))
@@ -320,6 +358,7 @@ summary() {
   for d in "${RO[@]}"; do echo "Read-only:   $d"; done
   echo "Lab guest:   $GUEST, read-only at /lab"
   echo "Mixins:      ${MIX[*]:-none}"
+  echo "Harness:     ${DEFAULT_HARNESS:-shell}"
   echo -e "Secrets:     $SECRETS\n"
 }
 
@@ -340,6 +379,7 @@ images:
 param:
   LabAgentUser: "$AGENT"
   LabMixins: "${MIX[*]}"
+  LabHarness: "$DEFAULT_HARNESS"
 mounts:
 EOF
   for d in "${RW[@]}"; do
@@ -409,7 +449,7 @@ create_instance() {
     warn "Instance $INST already exists. To build it again: lab rebuild --instance $INST"
     return 1
   fi
-  D_RW=(); D_RO=(); D_MIX=""
+  D_RW=(); D_RO=(); D_MIX=""; D_HARNESS=""
   plan || return 1
   if [[ $DRY ]]; then
     discard
@@ -432,6 +472,7 @@ rebuild() {
     if [[ ${M_RW[i]} == true ]]; then D_RW+=("${M_LOC[i]}"); else D_RO+=("${M_LOC[i]}"); fi
   done
   D_MIX=$(param LabMixins)
+  D_HARNESS=$(param LabHarness)
 
   plan || exit 1
   if [[ $DRY ]]; then
@@ -477,6 +518,13 @@ start() {
   fi
   ours || exit 1
   AGENT=$(param LabAgentUser)
+  [[ $SHELL_ONLY ]] || HARNESS=${HARNESS:-$(param LabHarness)}
+  if [[ $HARNESS ]]; then
+    mixins=$(param LabMixins)
+    has_mixin "$mixins" "$HARNESS" || die "Harness $HARNESS is not one of $INST's mixins: $mixins"
+  elif (( ${#ARGS[@]} )); then
+    die "No default harness for $INST; name one of its mixins before --."
+  fi
 
   load_mounts
   RW=()
@@ -503,14 +551,17 @@ start() {
   import_keys
 
   # Land where you are if a mount puts that path in the guest, else in the
-  # agent's home. A login shell, so the keys are exported. The room exists
-  # while you are in it.
+  # agent's home. A login shell exports the keys before it starts the
+  # harness. The room exists while the shell or harness runs.
   land=/home/$AGENT
   here=$(pwd -P)
   for i in "${!M_LOC[@]}"; do
     [[ ${M_PT[i]} == "${M_LOC[i]}" ]] && within "$here" "${M_LOC[i]}" && land=$here
   done
-  "${LIMACTL[@]}" shell --workdir / "$INST" sudo -H -u "$AGENT" sh -c 'cd "$1" && exec bash -l' sh "$land"
+  session=(bash -l)
+  [[ $HARNESS ]] && session=(bash -lc 'exec "$@"' bash "$HARNESS" "${ARGS[@]}")
+  "${LIMACTL[@]}" shell --workdir / "$INST" sudo -H -u "$AGENT" sh -c 'cd "$1" && shift && exec "$@"' sh "$land" "${session[@]}"
+  session_rc=$?
   echo "Leaving $INST: stopping the VM..."
   "${LIMACTL[@]}" stop "$INST" < /dev/null
 
@@ -521,24 +572,40 @@ start() {
     echo "Do not run git there until you have inspected it." >&2
     exit 1
   fi
+  return "$session_rc"
 }
 
 # --- Arguments ---------------------------------------------------------
 
 main() {
-  VERB="" INST=lab SHOW="" DRY="" YES="" SIZE=()
+  VERB="" INST=lab SHOW="" DRY="" YES="" SIZE=() HARNESS="" SHELL_ONLY="" ARGS=()
   while (( $# )); do
     case $1 in
-      create|rebuild|harden) VERB=$1; shift ;;
+      create|rebuild|harden) [[ -z $VERB ]] || die "Choose one Lab verb."; VERB=$1; shift ;;
       --instance) [[ $2 ]] || die "--instance needs a name"; INST=$2; shift 2 ;;
       --cpus|--memory|--disk) [[ $2 ]] || die "$1 needs a value"; SIZE+=("$1" "$2"); shift 2 ;;
       --show) SHOW=1; shift ;;
+      --shell) SHELL_ONLY=1; shift ;;
       --yes)  YES=1; shift ;;
       -n)     DRY=1; shift ;;
       -h|--help) usage; exit ;;
-      *) usage >&2; exit 1 ;;
+      --) shift; ARGS=("$@"); break ;;
+      -*) usage >&2; exit 1 ;;
+      *)
+        HARNESS=$1; shift
+        if (( $# )); then
+          [[ $1 == -- ]] || die "Harness arguments must follow --; Lab options go before the harness."
+          shift
+        fi
+        ARGS=("$@"); break ;;
     esac
   done
+  if [[ $VERB && ( $HARNESS || $SHELL_ONLY || ${#ARGS[@]} -gt 0 ) ]]; then
+    die "Harness selection and --shell are only for starting a room."
+  fi
+  if [[ $SHELL_ONLY && ( $HARNESS || ${#ARGS[@]} -gt 0 ) ]]; then
+    die "--shell cannot be combined with a harness or harness arguments."
+  fi
   require_lima
   # The store by its physical path, not created here: the mounts it's tested
   # against are physical, and git's rev-parse reports physical paths, so a
