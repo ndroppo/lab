@@ -1,0 +1,139 @@
+#!/bin/bash
+# git: lazy, guest-local metadata for Lab's locked worktree pointers.
+# The wrapper is a convenience, not a wall. Arguments and the caller's
+# environment reach /usr/bin/git unchanged after the first sync each boot.
+
+[[ -r /etc/lab.env ]] || exec /usr/bin/git "$@"
+. /etc/lab.env
+[[ $LAB_GIT_STORE ]] || exec /usr/bin/git "$@"   # pre-guest-git instance
+
+# Resolve only Git's repository-location options, never its subcommands.
+# Unknown global options are left entirely to Git rather than guessed at.
+# Explicit GIT_DIR/--git-dir can sync an existing copy; a first copy also
+# needs a worktree, supplied explicitly or found through its .git pointer.
+locate() {
+  dir=$(pwd -P) || return 1
+  pointed=""
+  explicit=$GIT_DIR
+  tree=$GIT_WORK_TREE
+  while (( $# )); do
+    case $1 in
+      -C)
+        (( $# > 1 )) || return 1
+        [[ $2 ]] && dir=$(cd "$dir" && cd "$2" && pwd -P)
+        [[ $dir ]] || return 1
+        shift 2 ;;
+      -C?*) dir=$(cd "$dir" && cd "${1:2}" && pwd -P) || return 1; shift ;;
+      --git-dir) (( $# > 1 )) || return 1; explicit=$2; shift 2 ;;
+      --git-dir=*) explicit=${1#*=}; shift ;;
+      --work-tree) (( $# > 1 )) || return 1; tree=$2; shift 2 ;;
+      --work-tree=*) tree=${1#*=}; shift ;;
+      -c|--config-env|--namespace) (( $# > 1 )) || return 1; shift 2 ;;
+      --config-env=*|--namespace=*|-c?*|--no-pager|--paginate|-p|-P|--no-optional-locks|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-lazy-fetch|--no-advice) shift ;;
+      -*) return 1 ;;
+      *) break ;;
+    esac
+  done
+  worktree=""
+  search=$dir
+  while :; do
+    if [[ -f $search/.git ]]; then
+      IFS= read -r pointer < "$search/.git"
+      [[ $pointer == 'gitdir: '* ]] || break
+      pointed=${pointer#gitdir: }
+      [[ $pointed == /* ]] || pointed=$search/$pointed
+      pointed=$(realpath -m "$pointed") || return 1
+      worktree=$search
+      break
+    fi
+    [[ -d $search/.git || $search == / ]] && break
+    parent=${search%/*}
+    parent=${parent:-/}
+    # Match Git's usual filesystem boundary during implicit discovery.
+    if [[ ! $GIT_DISCOVERY_ACROSS_FILESYSTEM && $(stat -c %d "$search") != $(stat -c %d "$parent") ]]; then break; fi
+    search=$parent
+  done
+  if [[ $explicit ]]; then
+    [[ $explicit == /* ]] || explicit=$dir/$explicit
+    gitdir=$(realpath -m "$explicit") || return 1
+    [[ $pointed == "$gitdir" ]] || worktree=""
+  else
+    gitdir=$pointed
+  fi
+  if [[ $tree ]]; then
+    [[ $tree == /* ]] || tree=$dir/$tree
+    worktree=$(cd "$tree" && pwd -P) || return 1
+  fi
+  [[ $gitdir == "$LAB_GIT_STORE"/* ]] || return 1
+  relative=${gitdir#"$LAB_GIT_STORE"/}
+  source=/mnt/lab-git/$relative
+  [[ -d $source ]] || return 1
+  [[ -d $gitdir || $worktree ]]
+}
+
+# Invoked only inside the sync subshell, which has no caller-local Git
+# environment. The original command retains all of it.
+copy_git() { /usr/bin/git --git-dir="$metadata" "$@"; }
+
+refresh_origin() {
+  copy_git fetch --quiet --atomic --prune origin || return 1
+  head=$(copy_git ls-remote --symref origin HEAD) || return 1
+  branch="" tip=""
+  while read -r value ref extra; do
+    if [[ $value == ref: && $ref == refs/heads/* && $extra == HEAD ]]; then
+      branch=${ref#refs/heads/}
+    elif [[ $ref == HEAD ]]; then
+      tip=$value
+    fi
+  done <<< "$head"
+  if [[ $branch ]]; then
+    copy_git symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$branch"
+  else
+    copy_git update-ref --no-deref -d refs/remotes/origin/HEAD || return 1
+    # Detached source HEADs are valid too. Fetch the commit even when no
+    # source branch names it; never turn it into a local branch implicitly.
+    [[ ! $tip ]] || copy_git fetch --quiet origin HEAD:refs/remotes/origin/HEAD
+  fi
+}
+
+sync_copy() (
+  # A hook can invoke git with GIT_INDEX_FILE, GIT_DIR, etc. Those belong
+  # to its command, not to this metadata bootstrap or its fetch.
+  while read -r name; do unset "$name"; done < <(/usr/bin/git -C / rev-parse --local-env-vars)
+  key=$(echo "$gitdir" | sha256sum)
+  key=${key%% *}
+  marker=/run/lab-git/$key.synced
+  exec 9> "/run/lab-git/$key.lock" || exit 1
+  flock 9 || exit 1
+  [[ -f $marker && -d $gitdir ]] && exit 0
+  metadata=$gitdir
+  if [[ -d $gitdir ]]; then
+    refresh_origin || exit 1
+  else
+    mkdir -p "${gitdir%/*}" || exit 1
+    metadata=$(mktemp -d "$gitdir.build.XXXXXX") || exit 1
+    trap '[[ $metadata == "$gitdir" ]] || rm -rf -- "$metadata"' EXIT
+    format=$(/usr/bin/git --git-dir="$source" rev-parse --show-object-format) || exit 1
+    /usr/bin/git init --quiet --bare --initial-branch=agent --object-format="$format" "$metadata" &&
+      copy_git config remote.origin.url "$source" &&
+      copy_git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*' &&
+      refresh_origin || exit 1
+    tip=$(copy_git rev-parse --verify --quiet refs/remotes/origin/HEAD)
+    if [[ $tip ]]; then
+      copy_git update-ref refs/heads/agent "$tip" || exit 1
+    fi
+    copy_git config core.bare false &&
+      copy_git config core.worktree "$worktree" &&
+      copy_git config core.logAllRefUpdates true &&
+      copy_git config checkout.guess false || exit 1
+    if [[ $tip ]]; then copy_git read-tree "$tip"; else copy_git read-tree --empty; fi || exit 1
+    mv -T "$metadata" "$gitdir" || exit 1
+    metadata=$gitdir
+  fi
+  : > "$marker"
+)
+
+if locate "$@"; then
+  sync_copy || { echo "git: could not sync Lab metadata for $gitdir; command not run." >&2; exit 1; }
+fi
+exec /usr/bin/git "$@"

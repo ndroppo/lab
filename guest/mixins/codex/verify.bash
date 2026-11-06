@@ -37,6 +37,16 @@ codex_config() {
   [[ $sandbox == '"danger-full-access"' && $daemon == false ]]
 }
 
+codex_transcripts() {
+  run readlink -f ~/.codex/sessions || { FINDING="sessions path unreadable"; return 1; }
+  [[ $OUT == /mnt/lab-state/codex/sessions ]] || { FINDING="sessions resolves to $OUT"; return 1; }
+  run findmnt -T ~/.codex/sessions -n -o FSTYPE,TARGET
+  read fs target <<< "$OUT"
+  FINDING="sessions on $target ($fs)"
+  [[ $fs == virtiofs && $target == /mnt/lab-state ]]
+}
+
 check install "Every binary from the Codex bundle is installed, root-owned, from one release." codex_installed
 check ripgrep "ripgrep, which Codex searches with, is on the agent's path." codex_ripgrep
 check config "Codex's system config turns off its own sandbox and its background daemon." codex_config
+check transcripts "Codex's rollouts live on the state mount." codex_transcripts

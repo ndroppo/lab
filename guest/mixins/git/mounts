@@ -1,0 +1,2 @@
+# parameter	source	guest-path (read-only)
+LabGitOrigin	@LabGitStore	/mnt/lab-git

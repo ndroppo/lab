@@ -12,42 +12,59 @@
 # Codex doesn't update itself unasked, so every boot checks the latest
 # release and reinstalls when it differs: packages go stale.
 
+# Only rollouts go on the mount. The index, credentials and configuration
+# remain on the guest's disk. Never follow state-mount links as root.
+su - "$PARAM_LabAgentUser" <<'AGENT' || exit 1
+umask 077
+mkdir -p /mnt/lab-state/codex/sessions "$HOME/.codex" || exit 1
+ln -sfnT /mnt/lab-state/codex/sessions "$HOME/.codex/sessions" || exit 1
+AGENT
+
 bindir=/usr/local/bin
 record=/usr/local/share/lab/codex   # the installed release: version, SHA256SUMS
 asset=codex-package-$(uname -m)-unknown-linux-musl.tar.gz
 installed=""
 [[ -f $record/version ]] && installed=$(cat "$record/version")
 
-release=$(curl -fsSL https://api.github.com/repos/openai/codex/releases/latest)
-if [[ -z $release ]]; then
-  [[ $installed ]] || { echo "codex: GitHub unreachable and codex is not installed." >&2; exit 1; }
-  echo "codex: GitHub unreachable; keeping installed codex $installed." >&2
+if ! release=$(curl -fsSL https://api.github.com/repos/openai/codex/releases/latest) ||
+   ! release_info=$(python3 -c '
+import json, re, sys
+try:
+    release = json.load(sys.stdin)
+    asset = next(a for a in release["assets"] if a["name"] == sys.argv[1])
+    version = release["tag_name"].rsplit("v", 1)[-1]
+    url = asset["browser_download_url"]
+    digest = asset["digest"]
+    if not (isinstance(version, str) and version and not re.search(r"\s", version)
+            and isinstance(url, str) and url.startswith("https://") and not re.search(r"\s", url)
+            and isinstance(digest, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)):
+        raise ValueError("missing or invalid bundle metadata")
+except (ValueError, TypeError, KeyError, StopIteration, AttributeError) as error:
+    sys.exit(f"codex: release metadata unreadable: {error}")
+print(version, url, digest.removeprefix("sha256:"))
+' "$asset" <<< "$release"); then
+  [[ $installed ]] || { echo "codex: Latest release unavailable and codex is not installed." >&2; exit 1; }
+  echo "codex: Latest release unavailable; keeping installed codex $installed." >&2
 else
-  read latest url digest <<< "$(python3 -c '
-import json, sys
-release = json.load(sys.stdin)
-asset = next(a for a in release["assets"] if a["name"] == sys.argv[1])
-version = release["tag_name"].rsplit("v", 1)[-1]
-print(version, asset["browser_download_url"], asset["digest"].removeprefix("sha256:"))
-' "$asset" <<< "$release")"
+  read latest url digest <<< "$release_info"
 
   if [[ $latest == "$installed" ]]; then
     echo "codex: $installed is current."
   else
     echo "codex: installing $latest (installed: ${installed:-none})."
     work=$(mktemp -d)
-    curl -fsSL "$url" -o "$work/codex.tar.gz"
+    curl -fsSL "$url" -o "$work/codex.tar.gz" || exit 1
     actual=$(sha256sum "$work/codex.tar.gz" | cut -d' ' -f1)
     if [[ $actual != "$digest" ]]; then
       echo "codex: checksum mismatch (expected $digest, got $actual); not installing." >&2
       exit 1
     fi
-    tar -xzf "$work/codex.tar.gz" -C "$work" bin
+    tar -xzf "$work/codex.tar.gz" -C "$work" bin || exit 1
     # The previous release's binaries go first, so none outlives its release.
     [[ -f $record/SHA256SUMS ]] && while read _ name; do rm -f "$bindir/$name"; done < "$record/SHA256SUMS"
-    install -o root -g root -m 755 "$work"/bin/* "$bindir/"
-    mkdir -p "$record"
-    (cd "$work/bin" && sha256sum -- *) > "$record/SHA256SUMS"
+    install -o root -g root -m 755 "$work"/bin/* "$bindir/" || exit 1
+    mkdir -p "$record" || exit 1
+    (cd "$work/bin" && sha256sum -- *) > "$record/SHA256SUMS" || exit 1
     echo "$latest" > "$record/version"   # last, so an interrupted install retries
     rm -rf "$work"
   fi

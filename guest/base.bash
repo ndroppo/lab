@@ -68,10 +68,13 @@ NFT
 systemctl enable --now nftables
 nft -f /etc/nftables.conf
 
-# What the guest needs to know about how it was built: the agent, mixins,
-# and default harness. verify.sh reads this; no name is hard-coded.
+# What base owns about the room: the agent, mixins, default harness and
+# host metadata location recorded for the host's git wall. This last fact
+# does not mount the store or prepare any guest metadata.
+# Mixins can append their own runtime facts after base has written this.
 {
   printf 'LAB_AGENT=%q\n' "$agent"
   printf 'LAB_MIXINS=%q\n' "$PARAM_LabMixins"
   printf 'LAB_HARNESS=%q\n' "$PARAM_LabHarness"
+  printf 'LAB_HOST_GIT_STORE=%q\n' "$PARAM_LabGitStore"
 } > /etc/lab.env

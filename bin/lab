@@ -3,10 +3,12 @@
 # `lab --help` for use. Needs Lima 2.2.0+. Written for the bash macOS ships.
 #
 # Touches: creates/deletes/starts/stops Lima instances it built, and no
-# others; creates an instance's secrets directory (mode 700) if missing;
-# at each start, replaces the agent's ~/.lab/keys/ in the guest
-# with the secrets directory's files; `harden` moves .git directories into
+# others; creates secrets, state and git-store directories (mode 700) if missing;
+# at each entry, refreshes the agent's ~/.lab/keys/ in the guest
+# from the secrets directory; `harden` moves .git directories into
 # $LAB_GIT_STORE.
+# State is mounted into its own instance only. Host code never writes into
+# it beyond creating the directory, and never reads files from it.
 #
 # A .git directory inside a writable mount is writable by the agent, and the
 # host runs what it finds there the next time you use git there. `harden`
@@ -14,6 +16,8 @@
 #   chflags nouchg <repo>/.git
 
 LIMACTL=(limactl --log-level warn)
+# Only the coordinator owns descriptor 9. No Lima child may retain its lock.
+lima() { "${LIMACTL[@]}" "$@" 9>&-; }
 REPO=$(dirname "$(dirname "$(realpath "$0")")")
 # Home by its physical path, so everything built from it - the default store,
 # the secrets directory, Lima's state - compares truly against the
@@ -21,7 +25,7 @@ REPO=$(dirname "$(dirname "$(realpath "$0")")")
 HOME=$(cd -P "$HOME" && pwd)
 STORE=${LAB_GIT_STORE:-$HOME/.lab/git}
 LIMA_DIR=${LIMA_HOME:-$HOME/.lima}
-GUEST=$REPO/guest   # all a room receives of this repo, read-only at /lab
+GUEST=$REPO/guest   # only bin/ and the selected mixin directories reach a room
 IMAGE=https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img
 
 warn() { echo "lab: $*" >&2; }
@@ -34,7 +38,8 @@ usage: lab [options] [harness] [-- args...]
 
   lab            start the default harness, creating the instance first
                  if run from a terminal; no default opens a shell
-  lab <harness>  start one of the instance's mixins as a command
+  lab <harness>  start one of the instance's harness mixins
+                 another lab joins the room; the last session out stops it
   lab create     create an instance without starting it
   lab rebuild    delete and recreate an instance lab built, its current
                  answers offered back as defaults
@@ -44,7 +49,7 @@ usage: lab [options] [harness] [-- args...]
   --shell                  open the agent's login shell, not a harness
   --yes                    take every default without asking; on create the
                            defaults are empty: a bare room, walls only,
-                           nothing mounted, no harness
+                           no user mounts or mixins
   -n                       dry run: every check and the plan, nothing changed
   --show                   print the generated Lima config
   --cpus/--memory/--disk   passed through to limactl create
@@ -52,6 +57,9 @@ usage: lab [options] [harness] [-- args...]
 Keys come from ~/.lab/secrets/<instance>, created empty (mode 700) with the
 instance: each file becomes the environment variable it's named for, in
 every guest shell, replaced at every start.
+Each room's state lives in ~/.lab/state/<instance>, read-write at
+/mnt/lab-state in that room alone. Harness transcripts there survive a
+rebuild; guest-only files and sign-ins do not.
 USAGE
 }
 
@@ -64,8 +72,12 @@ overlaps() { within "$1" "$2" || within "$2" "$1"; }
 physical() {
   if [[ -d $1 ]]; then
     cd -P "$1" && pwd
+  elif [[ -L $1 ]]; then
+    warn "Can't resolve directory symlink $1: its target must exist."
+    return 1
   elif [[ $1 == */* ]]; then
-    parent=$(physical "${1%/*}") || return 1
+    parent=${1%/*}
+    parent=$(physical "${parent:-/}") || return 1
     echo "$parent/${1##*/}"
   else
     return 1
@@ -86,7 +98,7 @@ ask_yes() {
 confirm() { [[ $YES ]] || ask_yes "$1" n; }
 
 require_lima() {
-  v=$(limactl --version) || die "Lab needs Lima 2.2.0+: https://lima-vm.io"
+  v=$(lima --version) || die "Lab needs Lima 2.2.0+: https://lima-vm.io"
   v=${v##* }
   v=${v#v}
   IFS=. read major minor _ <<< "$v"
@@ -95,8 +107,8 @@ require_lima() {
 
 # --- The instance, as Lima records it -----------------------------------
 
-instance_exists() { "${LIMACTL[@]}" list --format '{{.Name}}' | grep -qx "$INST"; }
-param()           { "${LIMACTL[@]}" list "$INST" --format "{{index .Config.Param \"$1\"}}"; }
+instance_exists() { lima list --format '{{.Name}}' | grep -qx "$INST"; }
+param()           { lima list "$INST" --format "{{index .Config.Param \"$1\"}}"; }
 
 # Lab built it if it carries LabAgentUser. Anything else lab leaves alone.
 ours() {
@@ -113,8 +125,48 @@ load_mounts() {
   M_RW=(); M_PT=(); M_LOC=()
   while IFS=, read rw pt loc; do
     [[ $loc ]] || continue
-    M_RW+=("$rw"); M_PT+=("${pt:-$loc}"); M_LOC+=("$loc")
-  done <<< "$("${LIMACTL[@]}" list "$INST" --format '{{range .Config.Mounts}}{{.Writable}},{{.MountPoint}},{{.Location}}{{"\n"}}{{end}}')"
+    resolved=$(physical "$loc") || return 1
+    M_RW+=("$rw"); M_PT+=("${pt:-$loc}"); M_LOC+=("$resolved")
+  done <<< "$(lima list "$INST" --format '{{range .Config.Mounts}}{{.Writable}},{{.MountPoint}},{{.Location}}{{"\n"}}{{end}}')"
+}
+
+# Separate Lab's own mounts from the user's. Matching the source as well
+# as the guest path prevents an unrelated mount from inheriting a privilege.
+managed_mount() {
+  local mixin j
+  [[ $3 == false ]] || return 1
+  [[ $1 == /lab/bin && $2 == "$GUEST/bin" ]] && return 0
+  for mixin in "${MIX[@]}"; do
+    [[ $1 == /lab/mixins/$mixin && $2 == "$GUEST/mixins/$mixin" ]] && return 0
+  done
+  for j in "${!RESOURCE_LOC[@]}"; do
+    [[ $1 == "${RESOURCE_PT[j]}" && $2 == "${RESOURCE_LOC[j]}" ]] && return 0
+  done
+  return 1
+}
+
+user_mounts() {
+  USER_RW=(); USER_LOC=(); USER_PT=()
+  for i in "${!M_LOC[@]}"; do
+    if managed_mount "${M_PT[i]}" "${M_LOC[i]}" "${M_RW[i]}"; then
+      continue
+    fi
+    if [[ ${M_PT[i]} == /mnt/lab-state ]]; then
+      [[ ${M_LOC[i]} == "$STATE" && ${M_RW[i]} == true ]] || {
+        warn "Refusing: $INST's state mount is not its own state directory. Rebuild it."
+        return 1
+      }
+      continue
+    fi
+    if within "${M_PT[i]}" /lab; then
+      warn "Refusing: $INST has an unexpected Lab source mount at ${M_PT[i]}. Rebuild it."
+      return 1
+    fi
+    USER_LOC+=("${M_LOC[i]}")
+    USER_PT+=("${M_PT[i]}")
+    [[ ${M_RW[i]} == true ]] && USER_RW+=("${M_LOC[i]}")
+  done
+  return 0
 }
 
 # --- The repo wall -------------------------------------------------------
@@ -124,36 +176,133 @@ load_mounts() {
 repo_wall() {
   hits=()
   for loc in "$@"; do
-    overlaps "$REPO" "$loc" && hits+=("$loc")
+    if overlaps "$REPO" "$loc" || overlaps "$LAB_HOME" "$loc"; then hits+=("$loc"); fi
   done
   (( ${#hits[@]} == 0 )) && return
-  warn "Refusing: this repo ($REPO) overlaps a writable mount: ${hits[*]}"
+  warn "Refusing: Lab's code or home ($REPO; $LAB_HOME) overlaps a writable mount: ${hits[*]}"
   warn "Run lab from a clone outside every writable mount."
   return 1
 }
 
 # --- The private wall -----------------------------------------------------
 
-# private_wall <mounted host directory>...: refuses when one overlaps the
-# secrets directory, the git store, or Lima's own state. The secrets
-# directory by its physical path, like the store, so a symlink leading into
-# a mount is caught - at every start too, since a link can change after
-# create.
-private_wall() {
-  secrets=$(physical "$SECRETS") || { warn "Can't resolve the secrets directory $SECRETS."; return 1; }
-  bad=0
-  for m in "$@"; do
-    for p in "$secrets" "$STORE" "$LIMA_DIR"; do
-      overlaps "$m" "$p" && { warn "Refusing: the mount $m exposes $p to the guest."; bad=1; }
+# Private regions, including other instances' symlinked secrets and state.
+# Only the instance directory names are read, never their contents.
+private_paths() {
+  PRIVATE=("$LAB_HOME" "$STORE" "$LIMA_DIR")
+  for region in "$LAB_HOME/secrets" "$LAB_HOME/state"; do
+    p=$(physical "$region") || return 1
+    PRIVATE+=("$p")
+    for entry in "$region"/*; do
+      [[ -d $entry || -L $entry ]] || continue
+      p=$(physical "$entry") || return 1
+      PRIVATE+=("$p")
     done
   done
-  (( bad == 0 ))
+}
+
+# User mounts may not enter Lab's home, even read-only. The same applies
+# when a private region has been relocated with a symlink.
+private_wall() {
+  private_paths || return 1
+  private_bad=0
+  for m in "$@"; do
+    if within "$m" "$REPO"; then
+      warn "Refusing: user mount $m enters the Lab repo $REPO."
+      private_bad=1
+    fi
+    for p in "${PRIVATE[@]}"; do
+      overlaps "$m" "$p" && { warn "Refusing: the mount $m exposes $p to the guest."; private_bad=1; }
+    done
+  done
+  (( private_bad == 0 ))
+}
+
+# State is writable, not executable host material. A symlink may relocate
+# it, but cannot turn code, secrets, git, Lima state, or another room's
+# state into this room's writable mount.
+state_wall() {
+  if overlaps "$STATE" "$REPO"; then
+    [[ $REPO == "$LAB_HOME" && $STATE == "$LAB_HOME/state/$INST" ]] || {
+      warn "Refusing: state $STATE overlaps the Lab repo $REPO."
+      return 1
+    }
+  fi
+  if overlaps "$STATE" "$LAB_HOME" && [[ $STATE != "$LAB_HOME/state/$INST" ]]; then
+    warn "Refusing: state $STATE enters a different region of Lab's home."
+    return 1
+  fi
+  for region in "$LAB_HOME/secrets" "$STORE" "$LIMA_DIR"; do
+    p=$(physical "$region") || return 1
+    overlaps "$STATE" "$p" && { warn "Refusing: state $STATE exposes $p."; return 1; }
+  done
+  for entry in "$LAB_HOME/secrets"/* "$LAB_HOME/state"/*; do
+    [[ $entry == "$LAB_HOME/state/$INST" ]] && continue
+    [[ -d $entry || -L $entry ]] || continue
+    p=$(physical "$entry") || return 1
+    overlaps "$STATE" "$p" && { warn "Refusing: state $STATE overlaps $entry ($p)."; return 1; }
+  done
+  return 0
+}
+
+# Only the git region is handed in, never a parent containing code, keys
+# or another room's state. A relocated store gets the same physical checks.
+store_wall() {
+  if overlaps "$STORE" "$REPO"; then
+    [[ $REPO == "$LAB_HOME" ]] && within "$STORE" "$LAB_HOME/git" || {
+      warn "Refusing: git store $STORE overlaps the Lab repo $REPO."
+      return 1
+    }
+  fi
+  if overlaps "$STORE" "$LAB_HOME" && ! within "$STORE" "$LAB_HOME/git"; then
+    warn "Refusing: git store $STORE enters a different region of Lab's home."
+    return 1
+  fi
+  for region in "$LAB_HOME/secrets" "$LAB_HOME/state" "$LIMA_DIR"; do
+    p=$(physical "$region") || return 1
+    overlaps "$STORE" "$p" && { warn "Refusing: git store $STORE exposes $p."; return 1; }
+  done
+  for entry in "$LAB_HOME/secrets"/* "$LAB_HOME/state"/*; do
+    [[ -d $entry || -L $entry ]] || continue
+    p=$(physical "$entry") || return 1
+    overlaps "$STORE" "$p" && { warn "Refusing: git store $STORE exposes $entry ($p)."; return 1; }
+  done
+  return 0
+}
+
+# Existing instances record their store. An environment override may not
+# quietly make harden write somewhere other than the instance's origin.
+instance_store() {
+  recorded=$(param LabGitStore)
+  [[ $recorded ]] || return 0   # older instance, before the store was recorded
+  recorded=$(physical "$recorded") || return 1
+  [[ -d $recorded ]] || {
+    warn "Refusing: recorded git store $recorded is missing. Restore it before continuing; it is the protected host metadata location."
+    return 1
+  }
+  if [[ $LAB_GIT_STORE && $STORE != "$recorded" ]]; then
+    warn "Refusing: $INST uses git store $recorded, not $STORE. Rebuild to change it."
+    return 1
+  fi
+  STORE=$recorded
+}
+
+# Extra mounts are read-only. Protected metadata is an allowed data source,
+# whoever requests it; code, secrets, Lima and other rooms' state are not.
+readonly_wall() {
+  if within "$1" "$STORE"; then
+    store_wall
+  else
+    private_wall "$1"
+  fi
 }
 
 # --- The git wall --------------------------------------------------------
 
-# .git directories in writable mounts, pruning read-only mirror mounts (a
-# read-only mount elsewhere, like Lab's guest files at /lab, protects nothing here).
+# .git directories and unlocked pointers in writable mounts. A .git file
+# can point at metadata under any name, so directory-only scans miss an
+# execution surface. Read-only mirror mounts are pruned; an unrelated
+# read-only mount elsewhere protects nothing here.
 exposed() {
   roots=(); prunes=()
   for i in "${!M_LOC[@]}"; do
@@ -163,14 +312,23 @@ exposed() {
       prunes+=(-path "${M_LOC[i]}" -prune -o)
     fi
   done
-  (( ${#roots[@]} )) || return
-  find "${roots[@]}" "${prunes[@]}" \( -name node_modules -o -name .venv \) -prune -o \
-       -name .git -type d -prune -print
+  (( ${#roots[@]} )) || return 0
+  entries=$(find "${roots[@]}" "${prunes[@]}" -name .git -prune -print) || {
+    warn "Could not scan all writable mounts for git metadata."
+    return 1
+  }
+  while read -r entry; do
+    [[ $entry ]] || continue
+    if [[ -d $entry || -L $entry || ! -f $entry || $(stat -f %Sf "$entry") != *uchg* ]]; then
+      echo "$entry"
+    fi
+  done <<< "$entries"
 }
 
 store_overlaps_a_mount() {
-  for loc in "${M_LOC[@]}"; do
-    overlaps "$STORE" "$loc" && { echo "$loc"; return; }
+  for i in "${!M_LOC[@]}"; do
+    [[ ${M_RW[i]} == false ]] && within "${M_LOC[i]}" "$STORE" && continue
+    overlaps "$STORE" "${M_LOC[i]}" && { echo "${M_LOC[i]}"; return; }
   done
   return 1
 }
@@ -186,13 +344,14 @@ store_path() {
 harden() {
   instance_exists || { warn "No instance $INST: nothing to read its mounts from."; return 1; }
   ours || return 1
-  load_mounts
+  instance_store || return 1
+  load_mounts || return 1
   if hit=$(store_overlaps_a_mount); then
     warn "Refusing: store $STORE overlaps a mount the guest can see: $hit"
     return 1
   fi
 
-  list=$(exposed)
+  list=$(exposed) || return 1
   if [[ -z $list ]]; then
     echo "Nothing to move: no git metadata reachable from the guest."
     return
@@ -202,6 +361,11 @@ harden() {
   while read gitdir; do
     wt=${gitdir%/.git}
     dest=$(store_path "$wt")
+
+    if [[ ! -d $gitdir || -L $gitdir ]]; then
+      warn "skip   $wt: unprotected .git pointer; inspect it before using git. harden does not bless arbitrary pointers."
+      failed=1; continue
+    fi
 
     if [[ -d $gitdir/modules ]]; then
       warn "skip   $wt: has submodules; their relative pointers would break"
@@ -220,7 +384,7 @@ harden() {
       continue
     fi
 
-    # The store is made on the first real move, private to this account.
+    # Older instances may not have created the private store yet.
     [[ -d $STORE ]] || mkdir -p -m 700 "$STORE"
     if ! mkdir -p "${dest%/*}" || ! mv "$gitdir" "$dest"; then
       warn "FAIL   $wt: could not move metadata"
@@ -289,12 +453,19 @@ available_mixins() {
   done
 }
 
-# Recorded mixins are a space-separated list of command names.
+# Recorded mixins are space-separated capability names, not all harnesses.
 has_mixin() {
   for m in $1; do   # split the mixin list on purpose
     [[ $m == "$2" ]] && return 0
   done
   return 1
+}
+
+# A harness marker declares a launchable command with the mixin's name.
+harness_mixins() {
+  for name in $1; do   # one mixin per word: split on purpose
+    [[ -f $GUEST/mixins/$name/harness ]] && echo "$name"
+  done
 }
 
 # ask_mixins <current>: fills MIX, one y/n per mixin in the repo, defaulting
@@ -308,23 +479,25 @@ ask_mixins() {
   done
 }
 
-# ask_harness: choose a default from the selected mixins.
+# ask_harness: choose only from the selected, launchable harnesses.
 ask_harness() {
-  DEFAULT_HARNESS=${MIX[0]}
-  (( ${#MIX[@]} > 1 )) || return 0
-  if has_mixin "${MIX[*]}" "$D_HARNESS"; then
+  HARNESSES=()
+  for name in $(harness_mixins "${MIX[*]}"); do HARNESSES+=("$name"); done
+  DEFAULT_HARNESS=${HARNESSES[0]}
+  (( ${#HARNESSES[@]} > 1 )) || return 0
+  if has_mixin "${HARNESSES[*]}" "$D_HARNESS"; then
     DEFAULT_HARNESS=$D_HARNESS
   fi
   [[ $YES ]] && return
   while :; do
     answer=""
-    read -p "  Default harness (${MIX[*]}) [$DEFAULT_HARNESS]: " answer
+    read -p "  Default harness (${HARNESSES[*]}) [$DEFAULT_HARNESS]: " answer
     answer=${answer:-$DEFAULT_HARNESS}
-    if has_mixin "${MIX[*]}" "$answer"; then
+    if has_mixin "${HARNESSES[*]}" "$answer"; then
       DEFAULT_HARNESS=$answer
       return
     fi
-    echo "    choose one of: ${MIX[*]}"
+    echo "    choose one of: ${HARNESSES[*]}"
   done
 }
 
@@ -339,15 +512,106 @@ interview() {
 }
 
 # The plan's walls, before anything is mounted.
+provision_source() {
+  script=$(realpath "$1") || return 1
+  [[ -f $script ]] && within "$script" "${2:-$GUEST}" || {
+    warn "Refusing: source $1 must be a regular file within ${2:-$GUEST}."
+    return 1
+  }
+}
+
+mixin_sources() {
+  local m
+  for m in "${MIX[@]}"; do
+    [[ $m =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { warn "Invalid mixin name: $m"; return 1; }
+    case $m in
+      create|rebuild|harden) warn "Mixin $m conflicts with a Lab verb."; return 1 ;;
+    esac
+    [[ $(physical "$GUEST/mixins/$m") == "$GUEST/mixins/$m" ]] || { warn "Mixin $m must not redirect outside its directory."; return 1; }
+    provision_source "$GUEST/mixins/$m/provision.bash" "$GUEST/mixins/$m" || return 1
+  done
+  return 0
+}
+
+# A mixin's optional mounts file is data, never sourced as host shell:
+#   parameter<TAB>source<TAB>guest-path
+# Sources reference core path facts (@Key), not arbitrary host paths.
+# Each row contributes a path param and one read-only mount. No host hooks.
+mixin_resources() {
+  local mixin key source target extra value i found recorded_value path_keys path_values
+  PARAM_KEYS=(LabAgentUser LabMixins LabHarness LabGitStore)
+  PARAM_VALUES=("$AGENT" "${MIX[*]}" "$DEFAULT_HARNESS" "$STORE")
+  # Only intentionally shared path facts may be referenced, not arbitrary
+  # string params which happen to look like paths.
+  path_keys=(LabGitStore); path_values=("$STORE")
+  RESOURCE_LOC=(); RESOURCE_PT=()
+  for mixin in "${MIX[@]}"; do
+    [[ -e $GUEST/mixins/$mixin/mounts || -L $GUEST/mixins/$mixin/mounts ]] || continue
+    provision_source "$GUEST/mixins/$mixin/mounts" "$GUEST/mixins/$mixin" || return 1
+    while IFS=$'\t' read -r key source target extra || [[ $key ]]; do
+      [[ $key && $key != \#* ]] || continue
+      [[ $key =~ ^[A-Z][A-Za-z0-9]*$ && $source && $target && ! $extra ]] || {
+        warn "Invalid mount declaration in mixin $mixin: expected parameter, source and guest path, tab-separated."
+        return 1
+      }
+      has_mixin "${PARAM_KEYS[*]}" "$key" && { warn "Duplicate param $key in mixin $mixin."; return 1; }
+      [[ $source == @* ]] || { warn "Mount $key must reference a core path fact, not an arbitrary host path."; return 1; }
+      found=""
+      for i in "${!path_keys[@]}"; do
+        [[ ${path_keys[i]} == "${source#@}" ]] && { value=${path_values[i]}; found=1; break; }
+      done
+      [[ $found ]] || { warn "Unknown core path fact $source in mixin $mixin."; return 1; }
+      [[ $value == /* && $target == /* && $target != / && $target != */ ]] || {
+        warn "Mount $key needs an absolute host directory and guest path."; return 1;
+      }
+      case $target/ in
+        *//*|*/./*|*/../*) warn "Mount $key has a non-canonical guest path: $target"; return 1 ;;
+      esac
+      case $value/ in
+        *//*|*/./*|*/../*) warn "Mount $key has a non-canonical host path: $value"; return 1 ;;
+      esac
+      value=$(physical "$value") || return 1
+      if [[ $1 == recorded ]]; then
+        recorded_value=$(param "$key")
+        [[ $recorded_value == "$value" ]] || { warn "Param $key does not match its declaration in $INST; rebuild it."; return 1; }
+      fi
+      [[ ! -e $value || -d $value ]] || { warn "Mount $key is not a host directory: $value"; return 1; }
+      PARAM_KEYS+=("$key"); PARAM_VALUES+=("$value")
+      RESOURCE_LOC+=("$value"); RESOURCE_PT+=("$target")
+    done < "$GUEST/mixins/$mixin/mounts"
+  done
+  return 0
+}
+
+resource_walls() {
+  local i prior target
+  for i in "${!RESOURCE_LOC[@]}"; do
+    readonly_wall "${RESOURCE_LOC[i]}" || return 1
+    target=${RESOURCE_PT[i]}
+    for prior in /lab /mnt/lab-state "$@" "${RESOURCE_PT[@]:0:i}"; do
+      overlaps "$target" "$prior" && { warn "Mixin mount $target overlaps guest mount $prior."; return 1; }
+    done
+  done
+  return 0
+}
+
+# Quote data, including manifest values, rather than interpolating YAML syntax.
+yaml() {
+  local value=$1
+  value=${value//\\/\\\\}; value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}; value=${value//$'\r'/\\r}; value=${value//$'\t'/\\t}
+  printf '"%s"' "$value"
+}
+
 check_plan() {
   bad=0
-  for m in "${MIX[@]}"; do
-    case $m in
-      create|rebuild|harden) warn "Mixin $m conflicts with a Lab verb."; bad=1 ;;
-    esac
-  done
-  private_wall "${RW[@]}" "${RO[@]}" || bad=1
+  provision_source "$GUEST/base.bash" || bad=1
+  mixin_sources || bad=1
   repo_wall "${RW[@]}" || bad=1
+  private_wall "${RW[@]}" "${RO[@]}" || bad=1
+  state_wall || bad=1
+  store_wall || bad=1
+  mixin_resources && resource_walls "${RW[@]}" "${RO[@]}" || bad=1
   (( bad == 0 ))
 }
 
@@ -356,7 +620,11 @@ summary() {
   echo "Agent:       $AGENT"
   for d in "${RW[@]}"; do echo "Read-write:  $d"; done
   for d in "${RO[@]}"; do echo "Read-only:   $d"; done
-  echo "Lab guest:   $GUEST, read-only at /lab"
+  echo "Lab tools:   $GUEST/bin, read-only at /lab/bin"
+  for m in "${MIX[@]}"; do echo "Mixin:       $GUEST/mixins/$m, read-only at /lab/mixins/$m"; done
+  echo "Git wall:    protected host metadata in $STORE"
+  for i in "${!RESOURCE_LOC[@]}"; do echo "Read-only:   ${RESOURCE_LOC[i]} at ${RESOURCE_PT[i]}"; done
+  echo "State:       $STATE, read-write at /mnt/lab-state"
   echo "Mixins:      ${MIX[*]:-none}"
   echo "Harness:     ${DEFAULT_HARNESS:-shell}"
   echo -e "Secrets:     $SECRETS\n"
@@ -366,7 +634,7 @@ summary() {
 
 gen_config() {
   cat <<EOF
-# Generated by lab from $REPO for instance $INST.
+# Generated by lab for instance $INST.
 vmType: "vz"
 arch: "aarch64"
 mountType: "virtiofs"
@@ -374,38 +642,57 @@ containerd:
   system: false
   user: false
 images:
-  - location: "$IMAGE"
+  - location: $(yaml "$IMAGE")
     arch: "aarch64"
 param:
-  LabAgentUser: "$AGENT"
-  LabMixins: "${MIX[*]}"
-  LabHarness: "$DEFAULT_HARNESS"
-mounts:
 EOF
+  for i in "${!PARAM_KEYS[@]}"; do
+    echo "  $(yaml "${PARAM_KEYS[i]}"): $(yaml "${PARAM_VALUES[i]}")"
+  done
+  echo 'mounts:'
   for d in "${RW[@]}"; do
     cat <<EOF
-  - location: "$d"
+  - location: $(yaml "$d")
     writable: true
 EOF
   done
   for d in "${RO[@]}"; do
     cat <<EOF
-  - location: "$d"
+  - location: $(yaml "$d")
+    writable: false
+EOF
+  done
+  for i in "${!RESOURCE_LOC[@]}"; do
+    cat <<EOF
+  - location: $(yaml "${RESOURCE_LOC[i]}")
+    mountPoint: $(yaml "${RESOURCE_PT[i]}")
     writable: false
 EOF
   done
   cat <<EOF
-  - location: "$GUEST"
-    mountPoint: "/lab"
+  - location: $(yaml "$GUEST/bin")
+    mountPoint: "/lab/bin"
     writable: false
+EOF
+  for m in "${MIX[@]}"; do
+    cat <<EOF
+  - location: $(yaml "$GUEST/mixins/$m")
+    mountPoint: $(yaml "/lab/mixins/$m")
+    writable: false
+EOF
+  done
+  cat <<EOF
+  - location: $(yaml "$STATE")
+    mountPoint: "/mnt/lab-state"
+    writable: true
 provision:
   - mode: system
-    file: "$GUEST/base.bash"
+    file: $(yaml "$GUEST/base.bash")
 EOF
   for m in "${MIX[@]}"; do
     cat <<EOF
   - mode: system
-    file: "$GUEST/mixins/$m/provision.bash"
+    file: $(yaml "$GUEST/mixins/$m/provision.bash")
 EOF
   done
 }
@@ -424,19 +711,25 @@ plan() {
     cat "$CFG"
     echo "--- end of config ---"
   fi
-  "${LIMACTL[@]}" validate "$CFG" || { discard; return 1; }
+  lima validate "$CFG" || { discard; return 1; }
 }
 
 # The plan's temp config, removed whenever the plan stops short of create.
 discard() { rm -rf "${CFG%/*}"; }
 
-# lima_create: creates the secrets directory if it's missing, then the
-# instance. The config is kept only if limactl create itself fails.
+# lima_create: prepares the core directories, then the instance.
+# The config is kept only if limactl create itself fails.
 lima_create() {
   if [[ ! -d $SECRETS ]]; then
     mkdir -p -m 700 "$SECRETS" || { discard; return 1; }
   fi
-  if ! "${LIMACTL[@]}" create --name "$INST" --tty=false "${SIZE[@]}" "$CFG"; then
+  if [[ ! -d $STATE ]]; then
+    mkdir -p -m 700 "$STATE" || { discard; return 1; }
+  fi
+  if [[ ! -d $STORE ]]; then
+    mkdir -p -m 700 "$STORE" || { discard; return 1; }
+  fi
+  if ! lima create --name "$INST" --tty=false "${SIZE[@]}" "$CFG"; then
     warn "limactl create failed. The generated config is kept at $CFG"
     return 1
   fi
@@ -465,7 +758,7 @@ rebuild() {
   ours || exit 1
 
   # Mirror mounts only are offered back, which also leaves out the guest files at /lab.
-  load_mounts
+  load_mounts || exit 1
   D_RW=(); D_RO=()
   for i in "${!M_LOC[@]}"; do
     [[ ${M_PT[i]} == "${M_LOC[i]}" ]] || continue
@@ -480,8 +773,8 @@ rebuild() {
     echo "Dry run: $INST left as it is."
     return
   fi
-  confirm "Delete $INST and build it again? Everything in the guest is wiped." || { discard; exit 1; }
-  "${LIMACTL[@]}" delete "$INST" || { discard; exit 1; }
+  confirm "Delete $INST and build it again? Guest-only files and sign-ins are lost; transcripts on the state mount survive." || { discard; exit 1; }
+  lima delete "$INST" || { discard; exit 1; }
   lima_create || exit 1
 }
 
@@ -489,52 +782,136 @@ rebuild() {
 
 # A command in the guest as the agent. Callers that aren't feeding it input
 # close stdin, so a call never swallows input meant for the session.
-as_agent() { "${LIMACTL[@]}" shell --workdir / "$INST" sudo -u "$AGENT" "$@"; }
+as_agent() { lima shell --workdir / "$INST" sudo -u "$AGENT" "$@"; }
 
-# import_keys: replaces the agent's ~/.lab/keys/ with the secrets
-# directory's files. Base provisioning exports each from every login shell.
+# import_keys: atomically replaces each key, then removes withdrawn keys.
+# A joining shell must not make the directory disappear while another
+# login profile is exporting it. Base exports keys from every login shell.
 # A missing secrets directory is recreated empty.
 import_keys() {
+  local keys file names
   keys=/home/$AGENT/.lab/keys
-  as_agent sh -c 'umask 077; rm -rf "$1"; mkdir -p "$1"' sh "$keys" < /dev/null
+  as_agent sh -c 'umask 077; mkdir -p "$1" && rm -f "$1"/.key.*' sh "$keys" < /dev/null || return 1
   if [[ ! -d $SECRETS ]]; then
-    mkdir -p -m 700 "$SECRETS" && echo "Recreated the missing secrets directory $SECRETS, empty."
+    mkdir -p -m 700 "$SECRETS" || return 1
+    echo "Recreated the missing secrets directory $SECRETS, empty."
   fi
+  [[ -r $SECRETS && -x $SECRETS ]] || { warn "Cannot read secrets directory $SECRETS."; return 1; }
+  names=()
   for file in "$SECRETS"/*; do
-    [[ -f $file ]] && as_agent sh -c 'umask 077; cat > "$1"' sh "$keys/${file##*/}" < "$file"
+    [[ -f $file ]] || continue
+    names+=("${file##*/}")
+    as_agent sh -c '
+      umask 077
+      tmp=$(mktemp "$1/.key.XXXXXX") || exit 1
+      trap '\''rm -f "$tmp"'\'' EXIT
+      cat > "$tmp" && mv -Tf "$tmp" "$1/$2"
+    ' sh "$keys" "${file##*/}" < "$file" || return 1
   done
+  as_agent bash -c '
+    keys=$1; shift
+    for file in "$keys"/*; do
+      [[ -e $file || -L $file ]] || continue
+      keep=""
+      for name in "$@"; do [[ ${file##*/} == "$name" ]] && { keep=1; break; }; done
+      [[ $keep ]] || rm -rf "$file" || exit 1
+    done
+    exit 0
+  ' bash "$keys" "${names[@]}" < /dev/null
 }
 
 # --- Start -----------------------------------------------------------------
 
+# One kernel lock serializes boot/join and last-out shutdown in this Lima
+# home. Keep its inode: deleting a lock file could strand another waiter.
+# Perl exposes flock (2 = LOCK_EX) on macOS versions whose lockf lacks descriptor mode.
+lifecycle_lock() {
+  exec 9<> "$LIMA_DIR/.lab-lifecycle.lock" || return 1
+  /usr/bin/perl -e 'flock(STDIN, 2) or die "lab: lifecycle lock: $!\n"' <&9 || {
+    exec 9>&-
+    return 1
+  }
+}
+
+lifecycle_unlock() { exec 9>&-; }
+
+other_instances() {
+  local rooms
+  rooms=$(lima list --format '{{.Name}} {{.Status}}') || return 1
+  running=$(awk -v me="$INST" '$2 == "Running" && $1 != me { print $1 }' <<< "$rooms")
+  [[ ! $running ]] || { warn "Refusing to start: another Lima instance is running: $running"; return 1; }
+}
+
+# Select our live shell processes, not hostagents, SSH children, key import
+# or shell arguments which happen to mention a room. The tag distinguishes
+# the same instance name in different LIMA_HOME directories. It is just a
+# process argument, never a counter or a guest-supplied claim.
+select_sessions() {
+  awk -v instance="$INST" -v tag="$SESSION_TAG" '
+    $3 ~ /(^|\/)limactl$/ && $4 == "--log-level" && $5 == "warn" &&
+    $6 == "shell" && $7 == "--workdir" && $8 == "/" && $9 == instance &&
+    index(" " $0 " ", " " tag " ") { print $1 }
+  '
+}
+
+read_sessions() {
+  SESSION_PROCESSES=$(ps -ww -U "$UID" -o pid=,ppid=,args=) || return 1
+  SESSION_PIDS=$(select_sessions <<< "$SESSION_PROCESSES")
+}
+
+session_signal() {
+  if [[ $SESSION_PID ]]; then
+    kill -s "$1" "$SESSION_PID" 2>/dev/null   # it may have just exited
+  else
+    exit "$2"
+  fi
+}
+
 start() {
-  running=$("${LIMACTL[@]}" list --format '{{.Name}} {{.Status}}' | awk -v me="$INST" '$2 == "Running" && $1 != me { print $1 }')
-  [[ -z $running ]] || die "Refusing to start: another Lima instance is running: $running"
+  other_instances || exit 1
 
   if ! instance_exists; then
     [[ -t 0 ]] || die "No instance $INST; run: lab create --instance $INST"
     create_instance || exit 1
     [[ $DRY ]] && return
   fi
+  if [[ ! $DRY ]]; then
+    [[ -x /usr/bin/perl ]] || die "Session coordination needs macOS's /usr/bin/perl."
+    SESSION_TAG=$(printf '%s\n' "$LIMA_DIR/$INST" | shasum -a 256) || exit 1
+    SESSION_TAG=lab-session-${SESSION_TAG%% *}
+    SESSION_PID=""
+    trap lifecycle_unlock EXIT
+    trap 'session_signal INT 130' INT
+    trap 'session_signal TERM 143' TERM
+    trap 'session_signal HUP 129' HUP
+    lifecycle_lock || exit 1
+    # The earlier check was before any interactive create or lock wait.
+    other_instances || exit 1
+  fi
   ours || exit 1
+  instance_store || exit 1
   AGENT=$(param LabAgentUser)
-  [[ $SHELL_ONLY ]] || HARNESS=${HARNESS:-$(param LabHarness)}
+  mixins=$(param LabMixins)
+  read -r -a MIX <<< "$mixins"
+  DEFAULT_HARNESS=$(param LabHarness)
+  mixin_sources && mixin_resources recorded || exit 1
+  [[ $SHELL_ONLY ]] || HARNESS=${HARNESS:-$DEFAULT_HARNESS}
   if [[ $HARNESS ]]; then
-    mixins=$(param LabMixins)
-    has_mixin "$mixins" "$HARNESS" || die "Harness $HARNESS is not one of $INST's mixins: $mixins"
+    harnesses=$(harness_mixins "$mixins")
+    has_mixin "$harnesses" "$HARNESS" || die "Harness $HARNESS is not a launchable harness in $INST: ${harnesses:-none}"
   elif (( ${#ARGS[@]} )); then
-    die "No default harness for $INST; name one of its mixins before --."
+    die "No default harness for $INST; select a harness mixin, or use --shell without harness arguments."
   fi
 
-  load_mounts
-  RW=()
-  for i in "${!M_LOC[@]}"; do
-    [[ ${M_RW[i]} == true ]] && RW+=("${M_LOC[i]}")
-  done
-  repo_wall "${RW[@]}" || exit 1
-  private_wall "${M_LOC[@]}" || exit 1
+  load_mounts || exit 1
+  user_mounts || exit 1
+  repo_wall "${USER_RW[@]}" || exit 1
+  private_wall "${USER_LOC[@]}" || exit 1
+  state_wall || exit 1
+  store_wall || exit 1
+  resource_walls "${USER_PT[@]}" || exit 1
 
-  left=$(exposed)
+  left=$(exposed) || die "Refusing to start: the git metadata scan did not complete."
   if [[ $left ]]; then
     warn "Refusing to start: git metadata reachable from the guest:"
     echo "$left" >&2
@@ -545,10 +922,25 @@ start() {
     return
   fi
 
-  # Lima's INFO lines are suppressed, so say what the wait is for.
-  echo "Entering $INST: starting the VM..."
-  "${LIMACTL[@]}" start --tty=false "$INST" < /dev/null || exit 1
-  import_keys
+
+  if [[ ! -d $STATE ]]; then
+    mkdir -p -m 700 "$STATE" || exit 1
+    echo "Recreated the missing state directory $STATE, empty."
+  fi
+  status=$(lima list "$INST" --format '{{.Status}}') || exit 1
+  started_here=""
+  if [[ $status == Running ]]; then
+    echo "Entering $INST: joining the running VM..."
+  else
+    # Lima's INFO lines are suppressed, so say what the wait is for.
+    echo "Entering $INST: starting the VM..."
+    lima start --tty=false "$INST" < /dev/null || exit 1
+    started_here=1
+  fi
+  if ! import_keys; then
+    [[ $started_here ]] && lima stop "$INST" < /dev/null
+    die "Key import failed; not opening a session."
+  fi
 
   # Land where you are if a mount puts that path in the guest, else in the
   # agent's home. A login shell exports the keys before it starts the
@@ -560,18 +952,59 @@ start() {
   done
   session=(bash -l)
   [[ $HARNESS ]] && session=(bash -lc 'exec "$@"' bash "$HARNESS" "${ARGS[@]}")
-  "${LIMACTL[@]}" shell --workdir / "$INST" sudo -H -u "$AGENT" sh -c 'cd "$1" && shift && exec "$@"' sh "$land" "${session[@]}"
-  session_rc=$?
-  echo "Leaving $INST: stopping the VM..."
-  "${LIMACTL[@]}" stop "$INST" < /dev/null
+  # Launch while locked, retaining terminal stdin and normal child signals.
+  # The session must not inherit the lifecycle lock itself.
+  (trap - INT QUIT HUP TERM; exec "${LIMACTL[@]}" shell --workdir / "$INST" sudo -H -u "$AGENT" sh -c 'cd "$1" && shift && exec "$@"' "$SESSION_TAG" "$land" "${session[@]}") <&0 9>&- &
+  SESSION_PID=$!
+  session_setup_failed=""
+  while :; do
+    if ! read_sessions; then
+      warn "Cannot observe host sessions; cancelling this entry."
+      session_setup_failed=1
+      kill -TERM "$SESSION_PID" 2>/dev/null   # it may have just exited
+      break
+    fi
+    has_mixin "$SESSION_PIDS" "$SESSION_PID" && break
+    # The child can finish before the first snapshot, or fail before exec.
+    awk -v pid="$SESSION_PID" -v parent="$$" '$1 == pid && $2 == parent && $3 != "<defunct>" { found=1 } END { exit !found }' <<< "$SESSION_PROCESSES" || break
+    sleep 0.05
+  done
+  lifecycle_unlock
 
-  left=$(exposed)
+  # A trapped signal can interrupt wait before its child has finished.
+  while :; do
+    wait "$SESSION_PID"
+    session_rc=$?
+    has_mixin "$(jobs -pr)" "$SESSION_PID" || break
+  done
+  SESSION_PID=""
+  [[ $session_setup_failed ]] && session_rc=1
+
+  stop_rc=0
+  if ! lifecycle_lock || ! read_sessions; then
+    warn "Cannot coordinate shutdown; leaving $INST running."
+    stop_rc=1
+  elif [[ $SESSION_PIDS ]]; then
+    echo "Leaving $INST: other sessions remain; the VM stays running."
+  elif ! status=$(lima list "$INST" --format '{{.Status}}'); then
+    warn "Cannot inspect $INST for shutdown."
+    stop_rc=1
+  elif [[ $status == Stopped ]]; then
+    echo "Leaving $INST: the VM is already stopped."
+  else
+    echo "Leaving $INST: last session, stopping the VM..."
+    lima stop "$INST" < /dev/null || stop_rc=$?
+  fi
+  lifecycle_unlock
+
+  left=$(exposed) || die "The exit git metadata scan did not complete. Inspect the writable mounts before using git."
   if [[ $left ]]; then
     echo -e "\nWARNING: git metadata appeared in a mount during this session:" >&2
     echo "$left" >&2
     echo "Do not run git there until you have inspected it." >&2
     exit 1
   fi
+  (( session_rc == 0 && stop_rc != 0 )) && return "$stop_rc"
   return "$session_rc"
 }
 
@@ -607,13 +1040,19 @@ main() {
     die "--shell cannot be combined with a harness or harness arguments."
   fi
   require_lima
+  [[ $(physical "$GUEST") == "$GUEST" ]] || die "The guest source directory must not redirect outside its declared path: $GUEST"
+  [[ -d $GUEST/bin && $(physical "$GUEST/bin") == "$GUEST/bin" ]] || die "The common tools must be a directory at their declared path: $GUEST/bin"
+  [[ $INST =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die "Invalid instance name: $INST"
+  LAB_HOME=$(physical "$HOME/.lab") || die "Can't resolve Lab's home."
+  LIMA_DIR=$(physical "$LIMA_DIR") || die "Can't resolve Lima's state directory."
   # The store by its physical path, not created here: the mounts it's tested
   # against are physical, and git's rev-parse reports physical paths, so a
   # symlinked store (macOS's /var -> /private/var) would otherwise slip past
   # the overlap test and fail every pointer's check.
   STORE=$(physical "$STORE") || die "Can't resolve the git store ${LAB_GIT_STORE:-$HOME/.lab/git}."
   AGENT=$USER-agent
-  SECRETS=$HOME/.lab/secrets/$INST
+  SECRETS=$LAB_HOME/secrets/$INST
+  STATE=$(physical "$LAB_HOME/state/$INST") || die "Can't resolve $INST's state directory."
 
   case $VERB in
     "")      start ;;

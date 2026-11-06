@@ -3,7 +3,7 @@
 #
 # Run inside the guest, as the agent user. Needs no privilege and changes
 # nothing. Prints one line per check - its verdict, its label, and what its
-# test found - a line counting the mounts, and a closing tally naming any
+# test found - a header counting the mounts, and a closing tally naming any
 # failures. The claims and the
 # evidence go to ~/.lab/verify.log, overwritten each run: each check's
 # claim, then every command it ran, with its full output and exit status.
@@ -75,19 +75,6 @@ check() {
   line "$mark"
 }
 
-# note <label> <claim> <test>...: like check, for a fact to read rather
-# than a verdict: marked ○, never counted.
-note() {
-  label=$1
-  claim=$2
-  shift 2
-  FINDING=""
-  echo -e "\n$label: $claim" >> "$LOG"
-  "$@" >> "$LOG" 2>&1
-  echo "○ $FINDING" >> "$LOG"
-  line ○
-}
-
 # line <mark>: the terminal's line for the current label and finding.
 line() { printf '  %s %-9s  %s\n' "$1" "$label" "$FINDING"; }
 
@@ -98,14 +85,17 @@ ro_mounts=()
 while read opts target; do
   if [[ ,$opts, == *,ro,* ]]; then ro_mounts+=("$target"); else rw_mounts+=("$target"); fi
 done <<< "$(findmnt -t virtiofs -ln -o OPTIONS,TARGET)"
+{
+  echo -e "\nHost content reaches the guest through these mounts:"
+  findmnt -t virtiofs -ln -o OPTIONS,TARGET
+} >> "$LOG"
 
 # .git entries in writable mounts, pruning read-only mirror mounts.
 git_scan() {
   prunes=()
   for m in "${ro_mounts[@]}"; do prunes+=(-path "$m" -prune -o); done
   (( ${#rw_mounts[@]} )) || return 0
-  find "${rw_mounts[@]}" "${prunes[@]}" \( -name node_modules -o -name .venv \) -prune -o \
-       -name .git "$@" -print
+  find "${rw_mounts[@]}" "${prunes[@]}" -name .git "$@" -print
 }
 
 # --- Tests longer than one command -----------------------------------------
@@ -149,13 +139,6 @@ private_unreachable() {
   (( left == 0 ))
 }
 
-# Host content reaches the guest only through its mounts, so they show
-# exactly what was handed in. Whether that matches intent is the host's call.
-mounts_handed_in() {
-  run findmnt -t virtiofs -ln -o OPTIONS,TARGET
-  FINDING="${#rw_mounts[@]} read-write, ${#ro_mounts[@]} read-only"
-}
-
 ro_mounts_refuse_writes() {
   (( ${#ro_mounts[@]} )) || { FINDING="no read-only mounts"; return 1; }
   refused=0
@@ -183,13 +166,17 @@ no_git_dirs() {
 pointers_locked() {
   locked=0
   writable=0
-  run git_scan -type f
+  other=0
+  run git_scan ! -type d || { FINDING="scan failed"; return 1; }
   while read p; do
     [[ $p ]] || continue
+    # Never open a FIFO or follow a .git symlink just to test a write.
+    if [[ -L $p || ! -f $p ]]; then ((other++)); continue; fi
     if run sh -c ': >> "$1"' sh "$p"; then ((writable++)); else ((locked++)); fi
   done <<< "$OUT"
   FINDING="$locked locked, $writable writable"
-  (( writable == 0 ))
+  (( other )) && FINDING+=", $other non-regular"
+  (( writable == 0 && other == 0 ))
 }
 
 no_checks() {
@@ -199,7 +186,8 @@ no_checks() {
 
 # --- The checks ------------------------------------------------------------
 
-echo -e "Lab verify for $LAB_AGENT on $(hostname)\n"
+echo "Lab verify for $LAB_AGENT on $(hostname)"
+echo -e "Mounts: ${#rw_mounts[@]} read-write, ${#ro_mounts[@]} read-only\n"
 echo Accounts
 check agent "The shell runs as the agent this instance was built for." is_the_agent
 check sudo "The agent cannot escalate." fails sudo -n true
@@ -212,7 +200,6 @@ check private "Private address space is unreachable." private_unreachable
 check fence "The agent cannot use nft." fails nft list ruleset
 
 echo -e "\nFilesystem"
-note mounts "Host content reaches the guest only through these mounts." mounts_handed_in
 check read-only "Every read-only mount refuses writes." ro_mounts_refuse_writes
 check "git dirs" "No git metadata directory is reachable in any writable mount." no_git_dirs
 check pointers "Every git pointer is locked." pointers_locked
