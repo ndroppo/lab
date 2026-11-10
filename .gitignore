@@ -4,3 +4,10 @@
 /secrets/
 /git/
 /state/
+.*.sw?
+
+# Guest tools share PATH with private user scripts. Only shipped tools ship.
+/guest/bin/*
+!/guest/bin/verify.sh
+!/guest/bin/fd
+!/guest/bin/backup.sh

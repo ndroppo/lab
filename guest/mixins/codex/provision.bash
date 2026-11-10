@@ -18,6 +18,8 @@ su - "$PARAM_LabAgentUser" <<'AGENT' || exit 1
 umask 077
 mkdir -p /mnt/lab-state/codex/sessions "$HOME/.codex" || exit 1
 ln -sfnT /mnt/lab-state/codex/sessions "$HOME/.codex/sessions" || exit 1
+. /lab/mixins/codex/backup.bash
+restore_on_boot || exit 1
 AGENT
 
 bindir=/usr/local/bin

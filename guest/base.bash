@@ -35,7 +35,7 @@ gpasswd -d "$agent" sudo
 passwd -q -l "$agent"
 
 apt-get -q update
-apt-get -q install -y git fd-find tmux nftables
+apt-get -q install -y git fd-find tmux nftables yq
 
 # Every login shell: Lab's guest tools on PATH, and each key lab placed in
 # ~/.lab/keys exported under its file's name.

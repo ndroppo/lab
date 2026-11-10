@@ -6,14 +6,16 @@
 # others; creates secrets, state and git-store directories (mode 700) if missing;
 # at each entry, refreshes the agent's ~/.lab/keys/ in the guest
 # from the secrets directory; `harden` moves .git directories into
-# $LAB_GIT_STORE.
-# State is mounted into its own instance only. Host code never writes into
-# it beyond creating the directory, and never reads files from it.
+# $LAB_GIT_STORE; `unharden` reverses it. `uninstall` stops/deletes Lab-built
+# instances, restores protected metadata, then removes the ~/.lab entry.
+# It never follows relocation links to delete their targets.
+# State is mounted into its own instance only. Outside explicit uninstall,
+# host code never writes into it beyond creating the directory, and never
+# reads files from it.
 #
 # A .git directory inside a writable mount is writable by the agent, and the
 # host runs what it finds there the next time you use git there. `harden`
-# moves it into $LAB_GIT_STORE behind an immutable pointer; undo by hand:
-#   chflags nouchg <repo>/.git
+# moves it into $LAB_GIT_STORE behind an immutable pointer.
 
 LIMACTL=(limactl --log-level warn)
 # Only the coordinator owns descriptor 9. No Lima child may retain its lock.
@@ -33,24 +35,29 @@ die()  { warn "$*"; exit 1; }
 
 usage() {
   cat <<'USAGE'
-usage: lab [options] [harness] [-- args...]
-       lab create|rebuild|harden [options]
+usage: lab [options] [command [args...]]
+       lab [options] -- [args for the default...]
+       lab create|rebuild|harden|uninstall [options]
+       lab unharden [options] <repo>|--all
 
   lab            start the default harness, creating the instance first
                  if run from a terminal; no default opens a shell
-  lab <harness>  start one of the instance's harness mixins
+  lab <command>  run any command on the agent's PATH; lab bash opens a shell
                  another lab joins the room; the last session out stops it
   lab create     create an instance without starting it
   lab rebuild    delete and recreate an instance lab built, its current
                  answers offered back as defaults
   lab harden     move exposed git metadata out of the guest's reach
+  lab unharden   move protected metadata home for one repo, or --all
+  lab uninstall  stop/delete Lab's instances, unharden repos, remove ~/.lab
+                 always asks for confirmation, even with --yes
 
-  --instance <name>        which instance (default: lab)
-  --shell                  open the agent's login shell, not a harness
+  --instance <name>        which instance (default: lab); not for removal
   --yes                    take every default without asking; on create the
                            defaults are empty: a bare room, walls only,
                            no user mounts or mixins
   -n                       dry run: every check and the plan, nothing changed
+  --all                    unharden every repo in the selected store
   --show                   print the generated Lima config
   --cpus/--memory/--disk   passed through to limactl create
 
@@ -410,6 +417,237 @@ harden() {
   return "$failed"
 }
 
+# --- Undo and removal ----------------------------------------------------
+
+# One snapshot of Lab-built instances; no other Lima instance is ours to
+# stop or delete. Commas separate the fixed fields; the store is last so
+# its path may contain commas as well as spaces.
+lab_instances() {
+  local rooms name status agent store
+  LAB_INSTANCES=(); LAB_STATUSES=(); LAB_STORES=()
+  rooms=$(lima list --format '{{.Name}},{{.Status}},{{index .Config.Param "LabAgentUser"}},{{index .Config.Param "LabGitStore"}}') || return 1
+  while IFS=, read -r name status agent store; do
+    [[ $name && $agent ]] || continue
+    LAB_INSTANCES+=("$name"); LAB_STATUSES+=("$status"); LAB_STORES+=("$store")
+  done <<< "$rooms"
+}
+
+no_lab_running() {
+  local j
+  lab_instances || return 1
+  for j in "${!LAB_INSTANCES[@]}"; do
+    [[ ${LAB_STATUSES[j]} == Running ]] || continue
+    warn "Refusing to unharden: Lab instance ${LAB_INSTANCES[j]} is running. Exit it first."
+    return 1
+  done
+}
+
+# Only a pointer to this repo's exact store entry counts, not a worktree
+# link or a .git symlink. Resolve the target: a relocated store can still
+# be named through its original symlink path.
+points_home() {
+  local pointer target
+  [[ -f $1/.git && ! -L $1/.git ]] || return 1
+  pointer=$(cat "$1/.git") || return 1
+  [[ $pointer == 'gitdir: /'* ]] || return 1
+  target=$(physical "${pointer#gitdir: }") || return 1
+  [[ $target == "$2" ]]
+}
+
+# Invert the store layout by testing both possible worktree paths. The
+# pointer, not the layout, establishes which one owns the metadata. Moved
+# or deleted worktrees leave an orphan; never guess where their history goes.
+unharden_plan() {
+  local entries dest relative candidate wt owner
+  UNHARDEN_REPOS=(); UNHARDEN_META=(); ORPHANS=()
+  [[ -d $STORE ]] || return 0
+  # A worktree's parent may itself be named *.git. Prune only metadata,
+  # not those ordinary path components; HEAD or objects also recognizes a
+  # damaged repo whose other marker is missing, so it can be rolled back.
+  entries=$(find "$STORE" -mindepth 1 -type d -name '*.git' \( -exec test -e '{}/HEAD' \; -o -exec test -d '{}/objects' \; \) -prune -print) || return 1
+  while IFS= read -r dest; do
+    [[ $dest ]] || continue
+    relative=${dest#"$STORE"/}; relative=${relative%.git}
+    owner=""
+    for candidate in "$HOME/$relative" "/$relative"; do
+      [[ -d $candidate ]] || continue
+      wt=$(physical "$candidate") || return 1
+      [[ $(store_path "$wt") == "$dest" ]] || continue
+      points_home "$wt" "$dest" || continue
+      if [[ $owner && $owner != "$wt" ]]; then
+        warn "Cannot match $dest: both $owner and $wt point to it. Inspect them first."
+        return 1
+      fi
+      owner=$wt
+    done
+    if [[ $owner ]]; then
+      UNHARDEN_REPOS+=("$owner"); UNHARDEN_META+=("$dest")
+    else
+      ORPHANS+=("$dest")
+    fi
+  done <<< "$entries"
+}
+
+restore_pointer() {
+  echo "gitdir: $2" > "$1/.git" && chflags uchg "$1/.git"
+}
+
+# A failed move restores the locked pointer. If git cannot open the moved
+# repo, put its metadata back too; never delete history to recover a failure.
+unharden_repo() {
+  local wt dest gitdir
+  wt=$1; dest=$2; gitdir=$wt/.git
+  points_home "$wt" "$dest" && [[ -d $dest && ! -L $dest ]] || {
+    warn "FAIL   $wt: not a pointer to its protected metadata at $dest"
+    return 1
+  }
+  if [[ $DRY ]]; then
+    echo "would  $dest -> $gitdir"
+    return 0
+  fi
+  chflags nouchg "$gitdir" || return 1
+  if ! rm "$gitdir"; then
+    chflags uchg "$gitdir"
+    return 1
+  fi
+  if ! mv "$dest" "$gitdir"; then
+    restore_pointer "$wt" "$dest" || warn "FAIL   $wt: move incomplete; inspect $gitdir and $dest before rerunning"
+    return 1
+  fi
+  if [[ $(git -C "$wt" rev-parse --absolute-git-dir) != "$gitdir" ]]; then
+    if mv "$gitdir" "$dest" && restore_pointer "$wt" "$dest"; then
+      warn "FAIL   $wt: git could not open the restored repo; rolled back"
+    else
+      warn "FAIL   $wt: rollback incomplete; inspect $gitdir and $dest before continuing"
+    fi
+    return 1
+  fi
+  echo "restored  $wt"
+}
+
+unharden() {
+  local wt dest j failed
+  # Share entry's kernel lock so a managed room cannot start between the
+  # running check and the move. A dry run only observes, creating nothing.
+  if [[ ! $DRY && -d $LIMA_DIR ]]; then lifecycle_lock || return 1; fi
+  no_lab_running || return 1
+  if [[ $ALL ]]; then
+    unharden_plan || return 1
+  else
+    wt=$(normalize "$UNHARDEN_REPO") || return 1
+    dest=$(store_path "$wt")
+    UNHARDEN_REPOS=("$wt"); UNHARDEN_META=("$dest"); ORPHANS=()
+  fi
+  failed=0
+  for j in "${!UNHARDEN_REPOS[@]}"; do
+    unharden_repo "${UNHARDEN_REPOS[j]}" "${UNHARDEN_META[j]}" || failed=1
+  done
+  for dest in "${ORPHANS[@]}"; do warn "orphan $dest: no matching repo pointer; left untouched"; done
+  (( ${#UNHARDEN_REPOS[@]} + ${#ORPHANS[@]} )) || echo 'Nothing to move: no protected metadata found.'
+  return "$failed"
+}
+
+# Uninstall includes every recorded store, the default and an override,
+# without relying on whichever instance happens to be named by --instance.
+uninstall_stores() {
+  local path resolved prior seen
+  REMOVE_STORES=()
+  for path in "$STORE" "$LAB_HOME/git" "${LAB_STORES[@]}"; do
+    [[ $path ]] || continue
+    [[ -d $path ]] || continue
+    resolved=$(physical "$path") || return 1
+    seen=""
+    for prior in "${REMOVE_STORES[@]}"; do [[ $prior == "$resolved" ]] && seen=1; done
+    [[ $seen ]] || REMOVE_STORES+=("$resolved")
+  done
+}
+
+# Only a real ~/.lab directory is recursively removed. A symlink there
+# preserves the whole relocated installation; other external targets and
+# store overrides likewise remain. Restoring live histories is separate.
+removal_action() {
+  if [[ ! -L $HOME/.lab ]] && within "$1" "$LAB_HOME"; then echo DELETE; else echo KEEP; fi
+}
+
+# Report relocation links without resolving them, including dangling ones.
+# No state file is read, no internal symlink is followed, and bundles are
+# conservatively called possibly unfetched: Lab has no fetch receipt.
+uninstall_data_plan() {
+  local region path kind
+  for region in secrets state; do
+    path=$LAB_HOME/$region
+    kind=credentials
+    [[ $region == state ]] && kind='persistent state (transcripts, backups and possibly unfetched delivery bundles)'
+    if [[ -L $path ]]; then
+      echo "  do not follow $kind link: $path -> $(readlink "$path")"
+      continue
+    fi
+    for path in "$LAB_HOME/$region"/*; do
+      if [[ -L $path ]]; then
+        echo "  do not follow $kind link: $path -> $(readlink "$path")"
+      elif [[ -e $path ]]; then
+        echo "  $(removal_action "$path") $kind: $path"
+      fi
+    done
+  done
+  [[ ! -L $LAB_HOME/git ]] || echo "  do not follow git-store link: $LAB_HOME/git -> $(readlink "$LAB_HOME/git")"
+  return 0
+}
+
+# %q makes element boundaries unambiguous even with spaces in paths.
+unharden_signature() { printf '%q\n' "${UNHARDEN_REPOS[@]}" -- "${UNHARDEN_META[@]}" -- "${ORPHANS[@]}"; }
+
+uninstall() {
+  local store j reply path
+  if [[ ! $DRY && -d $LIMA_DIR ]]; then lifecycle_lock || return 1; fi
+  lab_instances && uninstall_stores || return 1
+  echo 'Uninstall Lab:'
+  for j in "${!LAB_INSTANCES[@]}"; do
+    echo "  stop/delete instance ${LAB_INSTANCES[j]} (${LAB_STATUSES[j]})"
+  done
+  RESTORE_REPOS=(); RESTORE_META=(); PLAN_SIGNATURES=()
+  for store in "${REMOVE_STORES[@]}"; do
+    STORE=$store
+    unharden_plan || return 1
+    PLAN_SIGNATURES+=("$(unharden_signature)")
+    RESTORE_REPOS+=("${UNHARDEN_REPOS[@]}"); RESTORE_META+=("${UNHARDEN_META[@]}")
+    for j in "${!UNHARDEN_REPOS[@]}"; do echo "  unharden ${UNHARDEN_REPOS[j]}"; done
+    for path in "${ORPHANS[@]}"; do echo "  $(removal_action "$path") orphaned history $path"; done
+    [[ $(removal_action "$store") == KEEP ]] && echo "  KEEP external git store $store (after moving live histories home)"
+  done
+  uninstall_data_plan
+  [[ -L $HOME/.lab ]] && echo "  KEEP relocated installation target: $HOME/.lab -> $(readlink "$HOME/.lab")"
+  echo "  DELETE $HOME/.lab (links are removed, not followed; targets inside the deleted tree still go)"
+  echo '  Save anything you need from the locations marked DELETE before continuing.'
+  [[ $DRY ]] && { echo 'Dry run: nothing changed.'; return 0; }
+  reply=""
+  read -r -p 'Remove Lab and the data listed above? [y/N] ' reply
+  [[ $reply == [yY]* ]] || { echo 'Uninstall cancelled.'; return 1; }
+  for j in "${!LAB_INSTANCES[@]}"; do
+    [[ ${LAB_STATUSES[j]} == Running ]] || continue
+    lima stop "${LAB_INSTANCES[j]}" || return 1
+  done
+  # A running guest could have renamed a worktree while its user read the
+  # warning. Do not silently turn a promised restore into orphan deletion.
+  for j in "${!REMOVE_STORES[@]}"; do
+    STORE=${REMOVE_STORES[j]}
+    unharden_plan || return 1
+    [[ $(unharden_signature) == "${PLAN_SIGNATURES[j]}" ]] || {
+      warn 'Uninstall stopped: repo pointers changed while confirming. Nothing has been deleted; inspect and rerun for a fresh plan.'
+      return 1
+    }
+  done
+  for j in "${!RESTORE_REPOS[@]}"; do
+    unharden_repo "${RESTORE_REPOS[j]}" "${RESTORE_META[j]}" || {
+      warn 'Uninstall stopped: no instances or stored histories have been deleted. Fix the failed move and rerun.'
+      return 1
+    }
+  done
+  for j in "${!LAB_INSTANCES[@]}"; do lima delete "${LAB_INSTANCES[j]}" || return 1; done
+  rm -rf "$HOME/.lab" || return 1
+  echo 'Lab removed. Remove the ~/.lab/bin PATH line you added to your shell profile.'
+}
+
 # --- The interview -------------------------------------------------------
 #
 # Every answer can be left empty, and empty takes the default: nothing on
@@ -461,7 +699,7 @@ has_mixin() {
   return 1
 }
 
-# A harness marker declares a launchable command with the mixin's name.
+# A harness marker offers the mixin's command as a default candidate.
 harness_mixins() {
   for name in $1; do   # one mixin per word: split on purpose
     [[ -f $GUEST/mixins/$name/harness ]] && echo "$name"
@@ -479,7 +717,7 @@ ask_mixins() {
   done
 }
 
-# ask_harness: choose only from the selected, launchable harnesses.
+# ask_harness: choose a default from the selected harnesses.
 ask_harness() {
   HARNESSES=()
   for name in $(harness_mixins "${MIX[*]}"); do HARNESSES+=("$name"); done
@@ -524,9 +762,6 @@ mixin_sources() {
   local m
   for m in "${MIX[@]}"; do
     [[ $m =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { warn "Invalid mixin name: $m"; return 1; }
-    case $m in
-      create|rebuild|harden) warn "Mixin $m conflicts with a Lab verb."; return 1 ;;
-    esac
     [[ $(physical "$GUEST/mixins/$m") == "$GUEST/mixins/$m" ]] || { warn "Mixin $m must not redirect outside its directory."; return 1; }
     provision_source "$GUEST/mixins/$m/provision.bash" "$GUEST/mixins/$m" || return 1
   done
@@ -893,15 +1128,9 @@ start() {
   AGENT=$(param LabAgentUser)
   mixins=$(param LabMixins)
   read -r -a MIX <<< "$mixins"
-  DEFAULT_HARNESS=$(param LabHarness)
   mixin_sources && mixin_resources recorded || exit 1
-  [[ $SHELL_ONLY ]] || HARNESS=${HARNESS:-$DEFAULT_HARNESS}
-  if [[ $HARNESS ]]; then
-    harnesses=$(harness_mixins "$mixins")
-    has_mixin "$harnesses" "$HARNESS" || die "Harness $HARNESS is not a launchable harness in $INST: ${harnesses:-none}"
-  elif (( ${#ARGS[@]} )); then
-    die "No default harness for $INST; select a harness mixin, or use --shell without harness arguments."
-  fi
+  COMMAND=${COMMAND:-$(param LabHarness)}
+  COMMAND=${COMMAND:-bash}
 
   load_mounts || exit 1
   user_mounts || exit 1
@@ -943,18 +1172,19 @@ start() {
   fi
 
   # Land where you are if a mount puts that path in the guest, else in the
-  # agent's home. A login shell exports the keys before it starts the
-  # harness. The room exists while the shell or harness runs.
+  # agent's home. A login shell exports the keys before it execs the
+  # command. The room exists while that command runs.
   land=/home/$AGENT
   here=$(pwd -P)
   for i in "${!M_LOC[@]}"; do
     [[ ${M_PT[i]} == "${M_LOC[i]}" ]] && within "$here" "${M_LOC[i]}" && land=$here
   done
-  session=(bash -l)
-  [[ $HARNESS ]] && session=(bash -lc 'exec "$@"' bash "$HARNESS" "${ARGS[@]}")
   # Launch while locked, retaining terminal stdin and normal child signals.
   # The session must not inherit the lifecycle lock itself.
-  (trap - INT QUIT HUP TERM; exec "${LIMACTL[@]}" shell --workdir / "$INST" sudo -H -u "$AGENT" sh -c 'cd "$1" && shift && exec "$@"' "$SESSION_TAG" "$land" "${session[@]}") <&0 9>&- &
+  # Keep the script single-line so ps sees the tag before any user newlines.
+  (trap - INT QUIT HUP TERM; exec "${LIMACTL[@]}" shell --workdir / "$INST" sudo -H -u "$AGENT" bash -lc \
+    'cd "$1" || exit 1; shift; [[ $(type -P -- "$1") ]] || { echo "lab: command not found in guest: $1" >&2; exit 127; }; exec "$@"' \
+    "$SESSION_TAG" "$land" "$COMMAND" "${ARGS[@]}") <&0 9>&- &
   SESSION_PID=$!
   session_setup_failed=""
   while :; do
@@ -1011,45 +1241,72 @@ start() {
 # --- Arguments ---------------------------------------------------------
 
 main() {
-  VERB="" INST=lab SHOW="" DRY="" YES="" SIZE=() HARNESS="" SHELL_ONLY="" ARGS=()
+  VERB="" INST=lab INSTANCE_CHOSEN="" SHOW="" DRY="" YES="" SIZE=() COMMAND="" ARGS=() ALL="" UNHARDEN_REPO=""
   while (( $# )); do
     case $1 in
-      create|rebuild|harden) [[ -z $VERB ]] || die "Choose one Lab verb."; VERB=$1; shift ;;
-      --instance) [[ $2 ]] || die "--instance needs a name"; INST=$2; shift 2 ;;
+      create|rebuild|harden|unharden|uninstall) [[ -z $VERB ]] || die "Choose one Lab verb."; VERB=$1; shift ;;
+      --instance) [[ $2 ]] || die "--instance needs a name"; INST=$2; INSTANCE_CHOSEN=1; shift 2 ;;
       --cpus|--memory|--disk) [[ $2 ]] || die "$1 needs a value"; SIZE+=("$1" "$2"); shift 2 ;;
       --show) SHOW=1; shift ;;
-      --shell) SHELL_ONLY=1; shift ;;
       --yes)  YES=1; shift ;;
+      --all)  ALL=1; shift ;;
       -n)     DRY=1; shift ;;
       -h|--help) usage; exit ;;
-      --) shift; ARGS=("$@"); break ;;
+      --)
+        shift
+        if [[ $VERB == unharden ]]; then
+          [[ $# == 1 && ! $UNHARDEN_REPO ]] || die "Choose one repo, or --all."
+          UNHARDEN_REPO=$1
+        else
+          ARGS=("$@")
+        fi
+        break ;;
       -*) usage >&2; exit 1 ;;
       *)
-        HARNESS=$1; shift
-        if (( $# )); then
-          [[ $1 == -- ]] || die "Harness arguments must follow --; Lab options go before the harness."
-          shift
+        if [[ $VERB == unharden ]]; then
+          [[ ! $UNHARDEN_REPO ]] || die "Choose one repo, or --all."
+          UNHARDEN_REPO=$1; shift; continue
         fi
+        [[ $1 ]] || die "Guest command must not be empty."
+        COMMAND=$1; shift
         ARGS=("$@"); break ;;
     esac
   done
-  if [[ $VERB && ( $HARNESS || $SHELL_ONLY || ${#ARGS[@]} -gt 0 ) ]]; then
-    die "Harness selection and --shell are only for starting a room."
+  if [[ $INSTANCE_CHOSEN && ( $VERB == unharden || $VERB == uninstall ) ]]; then
+    die "$VERB is not instance-scoped; omit --instance."
   fi
-  if [[ $SHELL_ONLY && ( $HARNESS || ${#ARGS[@]} -gt 0 ) ]]; then
-    die "--shell cannot be combined with a harness or harness arguments."
+  if [[ $VERB == unharden ]]; then
+    [[ ( $UNHARDEN_REPO && ! $ALL ) || ( $ALL && ! $UNHARDEN_REPO ) ]] || die "Use lab unharden <repo>, or lab unharden --all."
+  elif [[ $ALL ]]; then
+    die "--all is only for unharden."
+  fi
+  if [[ $VERB && ( $COMMAND || ${#ARGS[@]} -gt 0 ) ]]; then
+    die "Guest commands are only for starting a room."
   fi
   require_lima
-  [[ $(physical "$GUEST") == "$GUEST" ]] || die "The guest source directory must not redirect outside its declared path: $GUEST"
-  [[ -d $GUEST/bin && $(physical "$GUEST/bin") == "$GUEST/bin" ]] || die "The common tools must be a directory at their declared path: $GUEST/bin"
+  if [[ $VERB != unharden && $VERB != uninstall ]]; then
+    [[ $(physical "$GUEST") == "$GUEST" ]] || die "The guest source directory must not redirect outside its declared path: $GUEST"
+    [[ -d $GUEST/bin && $(physical "$GUEST/bin") == "$GUEST/bin" ]] || die "The common tools must be a directory at their declared path: $GUEST/bin"
+  fi
   [[ $INST =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die "Invalid instance name: $INST"
-  LAB_HOME=$(physical "$HOME/.lab") || die "Can't resolve Lab's home."
+  if [[ $VERB == uninstall && ! -d $HOME/.lab ]]; then
+    LAB_HOME=$HOME/.lab   # a dangling installation link can still be removed
+  else
+    LAB_HOME=$(physical "$HOME/.lab") || die "Can't resolve Lab's home."
+  fi
   LIMA_DIR=$(physical "$LIMA_DIR") || die "Can't resolve Lima's state directory."
   # The store by its physical path, not created here: the mounts it's tested
   # against are physical, and git's rev-parse reports physical paths, so a
   # symlinked store (macOS's /var -> /private/var) would otherwise slip past
   # the overlap test and fail every pointer's check.
-  STORE=$(physical "$STORE") || die "Can't resolve the git store ${LAB_GIT_STORE:-$HOME/.lab/git}."
+  if [[ $VERB != uninstall ]]; then
+    STORE=$(physical "$STORE") || die "Can't resolve the git store ${LAB_GIT_STORE:-$HOME/.lab/git}."
+  fi
+  # Removal is repo/store-wide, independent of a selected room's state.
+  case $VERB in
+    unharden) unharden; return $? ;;
+    uninstall) uninstall; return $? ;;
+  esac
   AGENT=$USER-agent
   SECRETS=$LAB_HOME/secrets/$INST
   STATE=$(physical "$LAB_HOME/state/$INST") || die "Can't resolve $INST's state directory."
