@@ -171,7 +171,7 @@ What it can still do:
 - **Send what it can read to the internet.** It has the public internet, so don't share what shouldn't leave your Mac.
 - **Read its own keys.** The agent's tools use those keys, so it can see them, just as in any other sandbox.
 
-Codex has its own sandbox, which Lab turns off: the room is already the sandbox. A startup warning that `bwrap` is missing is expected.
+Both harnesses have their own guard, which Lab turns off: the room is already the sandbox. Claude Code starts with permission checks bypassed; run `claude --permission-mode auto` (or another mode) for a stricter session. Codex runs without its sandbox, and a startup warning that `bwrap` is missing is expected.
 
 ## Checking the room
 

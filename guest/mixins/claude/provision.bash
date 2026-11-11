@@ -20,10 +20,16 @@ try:
         settings = json.load(f)
 except FileNotFoundError:
     settings = {}
+before = json.dumps(settings, sort_keys=True)
 # A century, rather than Claude's 30-day default. Keep a higher user value.
-days = settings.get("cleanupPeriodDays", 0)
-if days < 36500:
+if settings.get("cleanupPeriodDays", 0) < 36500:
     settings["cleanupPeriodDays"] = 36500
+# Lab is the sandbox, so Claude's permission prompts go, as Codex's sandbox
+# does. Set every boot; a stricter session opts in with --permission-mode.
+# The flag skips the one-time bypass warning a headless guest can't answer.
+settings.setdefault("permissions", {})["defaultMode"] = "bypassPermissions"
+settings["skipDangerousModePermissionPrompt"] = True
+if json.dumps(settings, sort_keys=True) != before:
     with open(path, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")

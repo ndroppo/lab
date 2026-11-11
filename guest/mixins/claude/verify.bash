@@ -23,6 +23,14 @@ claude_transcripts() {
   [[ $OUT =~ ^[0-9]+$ ]] && (( OUT >= 36500 ))
 }
 
+claude_permissions() {
+  run python3 -c 'import json, sys; s = json.load(open(sys.argv[1])); print(json.dumps(s.get("permissions", {}).get("defaultMode")), json.dumps(s.get("skipDangerousModePermissionPrompt")))' ~/.claude/settings.json || { FINDING="settings unreadable"; return 1; }
+  read mode skip <<< "$OUT"
+  FINDING="defaultMode = $mode, skipDangerousModePermissionPrompt = $skip"
+  [[ $mode == '"bypassPermissions"' && $skip == true ]]
+}
+
 check install "claude is on the agent's path and reports its version." claude_installed
 check first-run "Claude Code's first-run onboarding is marked complete, so interactive claude doesn't stall on it." claude_onboarded
+check permissions "Claude Code starts with permission checks bypassed, since the room is the sandbox." claude_permissions
 check transcripts "Claude's projects live on the state mount, with at least a century's retention." claude_transcripts
