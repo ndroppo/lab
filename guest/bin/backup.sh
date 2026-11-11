@@ -17,9 +17,13 @@ mkdir -p "$BACKUP" "$HOME/.lab" || exit 1
 exec 9> "$HOME/.lab/backup.lock" || exit 1
 flock -n 9 || die "Another backup or restore is running."
 
+. /lab/bin/backup.bash || exit 1
+if [[ $action == restore ]]; then skills_restore || exit 1; fi
+
 for name in $LAB_MIXINS; do
   hook=/lab/mixins/$name/backup.bash
   [[ -f $hook ]] || continue
   ( . "$hook" && "$action" ) || exit 1
 done
+if [[ $action == backup ]]; then skills_backup || exit 1; fi
 echo "${action^} complete: $BACKUP"

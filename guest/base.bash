@@ -78,3 +78,10 @@ nft -f /etc/nftables.conf
   printf 'LAB_HARNESS=%q\n' "$PARAM_LabHarness"
   printf 'LAB_HOST_GIT_STORE=%q\n' "$PARAM_LabGitStore"
 } > /etc/lab.env
+
+# Harness-independent user skills recover before either harness starts.
+su - "$agent" <<'AGENT' || exit 1
+umask 077
+BACKUP=/mnt/lab-state/backup
+. /lab/bin/backup.bash && skills_restore --boot
+AGENT

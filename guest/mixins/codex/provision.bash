@@ -12,8 +12,8 @@
 # Codex doesn't update itself unasked, so every boot checks the latest
 # release and reinstalls when it differs: packages go stale.
 
-# Only rollouts go on the mount. The index, credentials and configuration
-# remain on the guest's disk. Never follow state-mount links as root.
+# Live rollouts use the mount; cold user-state snapshots restore locally
+# before Codex starts. Credentials require login. Never handle state as root.
 su - "$PARAM_LabAgentUser" <<'AGENT' || exit 1
 umask 077
 mkdir -p /mnt/lab-state/codex/sessions "$HOME/.codex" || exit 1

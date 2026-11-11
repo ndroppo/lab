@@ -2,7 +2,6 @@
 # Lab mixin: Claude Code. Runs as root on every boot, after base. Idempotent.
 
 agent=$PARAM_LabAgentUser
-home=$(getent passwd "$agent" | cut -d: -f6)
 
 # Set this up before Claude can write its first transcript. Everything on
 # the state mount, including any planted symlink, is handled as the agent.
@@ -12,6 +11,8 @@ su - "$agent" <<'AGENT' || exit 1
 umask 077
 mkdir -p /mnt/lab-state/claude/projects "$HOME/.claude" || exit 1
 ln -sfnT /mnt/lab-state/claude/projects "$HOME/.claude/projects" || exit 1
+. /lab/mixins/claude/backup.bash
+restore_on_boot || exit 1
 python3 - "$HOME/.claude/settings.json" <<'PY'
 import json, sys
 path = sys.argv[1]
@@ -47,9 +48,12 @@ version=$(su - "$agent" -c 'claude --version') || { echo "claude mixin: Claude C
 version=${version%% *}
 
 # Without these flags, interactive claude stalls on first-run onboarding,
-# which a headless guest can't complete. The installer creates ~/.claude.json,
+# which a headless guest can't complete. Restore or install supplies ~/.claude.json,
 # the agent's, mode 600; rewriting it in place keeps both.
-python3 - "$home/.claude.json" "$version" <<'PY'
+# Even this final merge runs as the agent: never follow a user-owned path
+# with root's permissions, including a symlink recovered from user state.
+printf -v version_arg '%q' "$version"
+su - "$agent" -c "umask 077; python3 - \"\$HOME/.claude.json\" $version_arg" <<'PY'
 import json, sys
 path, version = sys.argv[1], sys.argv[2]
 data = json.load(open(path))
