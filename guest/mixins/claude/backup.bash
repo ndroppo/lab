@@ -14,8 +14,10 @@ claude_state() {
   # Native default is ~/.claude.json; an explicit config directory puts it
   # inside that directory (confirmed against the installed Claude bundle).
   if [[ $CLAUDE_CONFIG_DIR ]]; then global=$home/.claude.json; else global=$HOME/.claude.json; fi
-  STATE_SKIP=(projects '.claude.json*' '.config.json*' '.credentials*' cache downloads session-env sessions
+  STATE_SKIP=('.claude.json*' '.config.json*' '.credentials*' cache downloads session-env sessions
     shell-snapshots backups '*.lock' '.last-*' 'remote-settings.json*' 'policy-limits.json*')
+  # Custom config directories may hold local transcripts, not Lab's state link.
+  [[ $(realpath -m -- "$home") != $(realpath -m -- "$HOME/.claude") ]] || STATE_SKIP+=(projects)
   STATE_EXCLUDE=()
 }
 
@@ -24,6 +26,7 @@ backup() (
   claude_state
   extra=$(mktemp -d) || exit 1
   trap 'rm -rf "$extra"' EXIT
+  state_config_save "$extra" "${CLAUDE_CONFIG_DIR:-}" || exit 1
   python3 "$CLAUDE_BACKUP_DIR/global.py" save "$global" "$extra/global.json" || exit 1
   backup_check() { claude_stopped; }
   state_save "$home" "$BACKUP/claude/state.tar" "$extra" || exit 1
@@ -31,6 +34,7 @@ backup() (
 )
 
 restore() (
+  state_config_restore "$BACKUP/claude/state.tar" CLAUDE_CONFIG_DIR || exit 1
   claude_state
   archive=$BACKUP/claude/state.tar
   if [[ ! -f $archive ]]; then
@@ -54,6 +58,7 @@ restore() (
 
 restore_on_boot() (
   BACKUP=${BACKUP:-/mnt/lab-state/backup}
+  state_config_restore "$BACKUP/claude/state.tar" CLAUDE_CONFIG_DIR || exit 1
   claude_state
   state_paths "$home"
   if [[ ! -e $home/.lab-restore ]]; then

@@ -11,7 +11,9 @@ codex_stopped() {
 codex_state() {
   # MCP OAuth's file fallback is CODEX_HOME/.credentials.json too:
   # https://github.com/openai/codex/blob/main/codex-rs/rmcp-client/src/oauth.rs
-  STATE_SKIP=(sessions 'auth.json*' '.credentials*' auth.lock tmp logs 'log' 'shell_snapshots' '.lab-index-restore' cache models_cache.json version.json installation_id '*.lock' thread-writer-locks)
+  STATE_SKIP=('auth.json*' '.credentials*' auth.lock tmp logs 'log' 'shell_snapshots' '.lab-index-restore' cache models_cache.json version.json installation_id '*.lock' thread-writer-locks)
+  # Only the default home's sessions are linked to persistent state by Lab.
+  [[ $(realpath -m -- "$home") != $(realpath -m -- "$HOME/.codex") ]] || STATE_SKIP+=(sessions)
   STATE_EXCLUDE=('skills/.system')
 }
 
@@ -20,13 +22,17 @@ backup() (
   home=${CODEX_HOME:-$HOME/.codex}
   [[ ! -e $home/.lab-index-restore ]] || { echo "codex: finish the index restore first." >&2; exit 1; }
   codex_state
+  extra=$(mktemp -d) || exit 1
+  trap 'rm -rf "$extra"' EXIT
+  state_config_save "$extra" "${CODEX_HOME:-}" || exit 1
   backup_check() { codex_stopped; }
-  state_save "$home" "$BACKUP/codex/state.tar" || exit 1
+  state_save "$home" "$BACKUP/codex/state.tar" "$extra" || exit 1
   rm -f "$BACKUP/codex/index.tar" || exit 1
   echo "codex: saved user state, including configuration, skills and cold SQLite."
 )
 
 restore() (
+  state_config_restore "$BACKUP/codex/state.tar" CODEX_HOME || exit 1
   home=${CODEX_HOME:-$HOME/.codex}
   if [[ ! -f $BACKUP/codex/state.tar ]]; then
     [[ ! -e $home/.lab-restore ]] || { echo "codex: interrupted restore has lost its archive." >&2; exit 1; }
@@ -41,6 +47,7 @@ restore() (
 
 restore_on_boot() (
   BACKUP=${BACKUP:-/mnt/lab-state/backup}
+  state_config_restore "$BACKUP/codex/state.tar" CODEX_HOME || exit 1
   home=${CODEX_HOME:-$HOME/.codex}
   if [[ -f $BACKUP/codex/state.tar ]]; then
     codex_state

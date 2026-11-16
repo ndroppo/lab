@@ -3,6 +3,33 @@
 # and backup_check (the cold-state check immediately before publication).
 # Symlinks are preserved, not followed. External targets need their own backup.
 
+# Keep the native config-directory choice inside the same atomic snapshot.
+# Empty means the native default; explicit paths are made absolute so boot's
+# working directory cannot change their meaning.
+state_config_save() {
+  local directory=${2:-}
+  [[ ! $directory || $directory == /* ]] || directory=$PWD/$directory
+  printf '%s\0' "$directory" > "$1/config-dir"
+}
+
+# Called in a harness's restore subshell, before choosing or checking its
+# destination. Older archives without this member retain the caller's choice.
+state_config_restore() {
+  local archive=$1 variable=$2 members directory
+  [[ -f $archive ]] || return 0
+  members=$(tar -tf "$archive") || return 1
+  [[ $'\n'$members$'\n' == *$'\n./config-dir\n'* ]] || return 0
+  if ! IFS= read -r -d '' directory < <(tar -xOf "$archive" ./config-dir); then
+    echo "restore: invalid config directory record; backup retained." >&2
+    return 1
+  fi
+  [[ ! $directory || $directory == /* ]] || {
+    echo "restore: config directory must be absolute; backup retained." >&2
+    return 1
+  }
+  printf -v "$variable" '%s' "$directory"
+}
+
 state_paths() {
   state_root=$1
   state_files=()
